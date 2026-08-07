@@ -1,0 +1,21 @@
+[Unit]
+Description=Telegram Userbot - Hermes auto-reply
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Ganti User/Group sesuai setup lu (contoh: ubuntu)
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/telegram-userbot
+EnvironmentFile=/etc/userbot.env
+ExecStart=/usr/bin/python3 /opt/telegram-userbot/main.py
+Restart=always
+RestartSec=5
+# Hardening dasar — jangan aktifin ProtectSystem kalau sandbox butuh tulis di /srv
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
