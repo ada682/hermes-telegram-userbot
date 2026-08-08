@@ -22,7 +22,7 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 # ── Telegram API credentials (ambil dari https://my.telegram.org → API development tools)
 API_ID = int(os.environ.get("TG_API_ID", "0"))
 API_HASH = os.environ.get("TG_API_HASH", "")
-SESSION_FILE = os.environ.get("SESSION_FILE", "kinji_userbot")
+SESSION_FILE = os.environ.get("SESSION_FILE", "fill_this_userbot")
 
 # ── LLM backend (OpenAI-compatible). Default: reuse backend Hermes.
 BASE_URL = os.environ.get("UB_BASE_URL", "https://inference-api.nousresearch.com/v1").rstrip("/")
@@ -58,7 +58,7 @@ REQUIRE_PREFIX = os.environ.get("UB_REQUIRE_PREFIX", "").strip()  # wake word: c
 # ── Voice note (ElevenLabs TTS): kalau user minta "voice note", reply-nya
 # dikonversi jadi VN (.ogg) pake API ini.
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "").strip()
-ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "cgSgspJ2msm6clMCkdW9")
+ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "put_your_elevenlabs_apikey")
 ELEVENLABS_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_flash_v2_5")
 ELEVENLABS_VOLUME = float(os.environ.get("ELEVENLABS_VOLUME", "0.85"))  # 1.0 = asli, 0.85 = agak pelan
 ELEVENLABS_SPEED = float(os.environ.get("ELEVENLABS_SPEED", "0.85"))  # via ffmpeg atempo (API speed di-ignore model flash). 1.0=kenceng, 0.85=santai, 0.5=slowmo
@@ -78,7 +78,7 @@ HISTORY_LEN = int(os.environ.get("UB_HISTORY", "12"))     # jumlah pesan konteks
 CMD_PREFIX = os.environ.get("UB_CMD_PREFIX", ".ub")       # perintah dari akun sendiri
 DANGER_PHRASE = os.environ.get(
     "UB_DANGER_PHRASE",
-    "gua tolak jing kontoljuga lu ya",
+    "gua tolak jing kontol juga lu ya",
 )  # balasan kalau ada yang nyuruh hal berbahaya ke server
 PERSONA = os.environ.get(
     "UB_PERSONA",
