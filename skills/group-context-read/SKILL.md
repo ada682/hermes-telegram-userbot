@@ -26,13 +26,12 @@ Do NOT read for:
 
 1. Locate the history file: it lives in the sandbox home for this chat — `~/.hermes/history.md` relative to this session's Hermes home (groups: `{sandbox}/groups/<id>/.hermes/history.md`, private: `{sandbox}/users/<id>/.hermes/history.md`).
 2. Read it with the `read_file` tool (or `tail` in terminal).
-3. If you need something specific, search past chat with the history-search service on port 9101.
-4. Reply using the recovered context — never invent facts about members or past events.
-5. Don't dump the whole history into your reply — use it as context only.
+3. Reply using the recovered context — never invent facts about members or past events.
+4. Don't dump the whole history into your reply — use it as context only.
 
 ## Format notes
 
-- The header (👑/🛡️ — owner, admins, custom member titles like "playa [kocokers]") is pinned at the TOP and never rotates — member titles live there.
+- The header (👑/🛡️ — owner, admins, custom member titles like "funcat [kocokers]") is pinned at the TOP and never rotates — member titles live there.
 - The file is FIFO ~100 lines — recent messages at the bottom.
 - Lines look like: `[dd/mm hh:mm](reply ke Nama) Nama: pesan`
 
