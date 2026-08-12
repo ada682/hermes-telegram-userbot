@@ -185,24 +185,61 @@ async def _send_media(event, paths) -> None:
             log.warning("send media gagal %s: %s", p, e)
 
 
-async def _send_sticker_pack(event, pack_name: str) -> bool:
-    """Kirim stiker dari pack yang tersedia (bukan cuma favorit).
-    pack_name: scuba, cewe, kucing, kucingv2, spongebob, kucingv3, crypto, meme, memev2
-    """
-    # Load packs from sticker_packs.json (shareable config)
+def _load_packs() -> dict:
+    """Load sticker packs dari sticker_packs.json → {pack_name: short_name}.
+    Support 2 format:
+      - baru: {"scuba": {"set": "...", "keywords": [...]}}
+      - lama: {"scuba": "short_name"}
+    Return {} kalau file rusak/gak ada — kode tetap jalan (pack gak ke-send)."""
     import json, os
     _packs_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sticker_packs.json')
     try:
         with open(_packs_path) as _f:
-            _packs = json.load(_f)
+            _raw = json.load(_f)
     except Exception:
-        _packs = {}
+        return {}
+    _packs = {}
+    for _name, _val in (_raw or {}).items():
+        if _name.startswith("_"):
+            continue  # skip comment key
+        if isinstance(_val, str):
+            _packs[_name] = _val  # format lama
+        elif isinstance(_val, dict) and _val.get("set"):
+            _packs[_name] = _val["set"]  # format baru
+    return _packs
+
+
+def _load_pack_aliases() -> dict:
+    """Build keyword → pack_name dari sticker_packs.json.
+    Tiap pack otomatis punya keyword = nama pack-nya + semua keywords
+    yang didefinisikan user di json. Jadi user baru TINGGAL edit json,
+    tanpa nyentuh kode."""
+    import json, os
+    _packs_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sticker_packs.json')
+    _aliases = {}
+    try:
+        with open(_packs_path) as _f:
+            _raw = json.load(_f)
+    except Exception:
+        return _aliases
+    for _name, _val in (_raw or {}).items():
+        if _name.startswith("_"):
+            continue
+        _aliases[_name] = _name  # nama pack = keyword default
+        if isinstance(_val, dict):
+            for _kw in (_val.get("keywords") or []):
+                _aliases[str(_kw).lower()] = _name
+    return _aliases
+
+
+async def _send_sticker_pack(event, pack_name: str) -> bool:
+    """Kirim stiker dari pack yang tersedia (bukan cuma favorit).
+    pack_name: key di sticker_packs.json (scuba, cewe, kucing, dst).
+    User baru nambah pack = edit sticker_packs.json aja."""
+    _packs = _load_packs()
     short_name = _packs.get(pack_name.lower().strip())
     if not short_name:
         log.warning('sticker pack tidak ditemukan: %s (cek sticker_packs.json)', pack_name)
-        return False
-    if not short_name:
-        log.warning('sticker pack tidak ditemukan: %s', pack_name)
         return False
     try:
         from telethon.tl.functions.messages import GetStickerSetRequest
@@ -1093,17 +1130,9 @@ async def _run_agent(event, _merged_text=None):
         # ── AUTO MAP sticker pack keyword supaya agent tidak accidentally
         # kirim favorite sticker saat user minta pack tertentu.
         # Contoh: 'sticker meme' → inject instruction eksplisit STICKER_PACK:memev2
-        _pack_aliases = {
-            'nsfw': 'nsfw',
-            'meme': 'meme',
-            'meme2': 'memev2',
-            'kucing': 'kucing',
-            'spongebob': 'spongebob',
-            'crypto': 'crypto',
-            'scuba': 'scuba',
-            'cewe': 'cewe',
-            'patrick': 'patrick',
-        }
+        # Mapping keyword → pack di-load dari sticker_packs.json (user baru
+        # tinggal tambah keywords di json, tanpa edit kode).
+        _pack_aliases = _load_pack_aliases()
         _sticker_match = re.search(r'(?i)\b(sticker|stiker)\s+([a-z0-9]+)\b', text)
         if _sticker_match:
             _kw = _sticker_match.group(2).lower()

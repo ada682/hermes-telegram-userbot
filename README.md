@@ -110,7 +110,7 @@ systemd service. Kamu cuma perlu isi 3 kredensial.
 ### 1. Install
 
 ```bash
-git clone https://github.com/ada682/hermes-telegram-userbot.git && cd telegram-userbot
+git clone <your-repo-url> && cd telegram-userbot
 pip3 install -r requirements.txt
 ```
 
@@ -201,8 +201,28 @@ sudo systemctl enable --now userbot
 | **Long-running tasks** | watch for `⏳ Working — N min` while the agent works |
 | **Cancel a task** | type `STOP` (or `stop` / `berhenti`) mid-run → in-flight work is cancelled, context stays |
 | **Search past chat** | `SONNET waktu itu kita bahas <X>?` → agent runs `scripts/history_search.py` and answers from the actual Telegram history (not its own memory); ask for the links → it replies with `t.me/...` message links |
-| **Get a sticker** | `SONNET kirim stiker <something>` → agent replies `STICKER:` and the account's favorite sticker lands as a separate bubble |
+| **Get a sticker** | `SONNET kirim stiker <something>` → agent replies `STICKER_PACK:<pack>` and a random sticker from that pack lands (packs in `sticker_packs.json`) |
 | **Send a video** | ask for a video file → agent writes it → `MEDIA:/path/video.mp4` delivers as inline video |
+
+---
+
+## 🎨 Sticker Packs (easy to add)
+
+All sticker packs live in **`sticker_packs.json`** — **no code changes needed** to add your own.
+
+```json
+{
+  "mypack": {
+    "set": "MyStickerSetShortName",
+    "keywords": ["mykey", "alternate", "alias"]
+  }
+}
+```
+
+- `set` = the sticker set **short name** (open the pack in Telegram → share link → the part after `addstickers/`, e.g. `hahahihi567_by_fStikBot`).
+- `keywords` = words users can type as `SONNET kirim stiker <keyword>`. The pack name itself is always a valid keyword too.
+- Old flat format is still supported: `"mypack": "ShortNameHere"`.
+- Users then ask: `SONNET kirim stiker mykey` → bot picks a random sticker from that pack.
 
 ---
 
