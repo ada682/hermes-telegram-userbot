@@ -62,28 +62,12 @@ This userbot turns your Telegram account into an **AI agent on autopilot**. Inst
 
 Sticker packs are configured via `sticker_packs.json` — no code changes needed to add or swap packs.
 
-### Available Packs
+### STICKER Usage
 
-| Alias | Pack Shortname |
-|---|---|
-| `scuba` | `itstank_by_fStikBot` |
-| `cewe` | `Vicidior` |
-| `kucing` | `hahahihi567_by_fStikBot` |
-| `kucingv2` | `enjaberryys_by_fStikBot` |
-| `spongebob` | `YangBroRasakanJrC1p0y` |
-| `kucingv3` | `TikTok_cats_animals` |
-| `crypto` | `Swagsmonke` |
-| `patrick` | `Gokujawa_by_fStikBot` |
-| `meme` | `video1725002678_by_Marin_Roxbot` |
-| `memev2` | `Pler437` |
-| `nsfw` | `Bbgwithddk` |
-
-### Usage
-
-User sends: `SONNET sticker meme`
+User sends: `(your_wake_up_call) sticker meme`
 Agent automatically maps to the configured pack and replies with `STICKER_PACK:memev2`.
 
-### Adding a New Pack
+### Adding a New STICKER Pack
 
 1. Open `sticker_packs.json`
 2. Add a new entry:
@@ -91,7 +75,7 @@ Agent automatically maps to the configured pack and replies with `STICKER_PACK:m
    "nama_alias": "shortname_pack_telegram"
    ```
 3. Restart the userbot
-4. Users can immediately use: `SONNET sticker nama_alias`
+4. Users can immediately use: ` (your_wake_up_call) sticker nama_alias`
 
 ---
 
