@@ -335,7 +335,8 @@ def get_history(chat_id):
     return history[chat_id]
 
 def on_cooldown(chat_id, user_id=0, cooldown=None) -> bool:
-    cooldown = cooldown or config.COOLDOWN
+    if cooldown is None:
+        cooldown = config.COOLDOWN
     last = cooldowns.get((chat_id, user_id))
     if last and datetime.utcnow() - last < timedelta(seconds=cooldown):
         return True
@@ -1507,16 +1508,17 @@ async def _run_agent(event):
                                     if _hp:
                                         with open(_hp, encoding="utf-8") as _f:
                                             _l = _f.read().splitlines()
-                                        _hb = [x for x in _l if not x.startswith(("👑", "🛡️"))]
+                                        _hb = [x for x in _l if x.startswith(("👑", "🛡️"))]
+                                        _hb = [x for x in _hb if x not in _admin_head.splitlines()]
+                                        _admin_head = "\n".join(_hb + _admin_head.splitlines())
                                         with open(_hp, "w", encoding="utf-8") as _f:
-                                            _f.write(_admin_head + "\n" + "\n".join(_hb) + "\n")
+                                            _f.write(_admin_head + "\n" + "\n".join(_l[len(_hb):]) + "\n")
                                 except Exception:
                                     pass
-                            if isinstance(_msgs, Exception) or not _msgs:
+                            if isinstance(_msgs, Exception):
                                 return ""
                             msgs = _msgs
-                            # map id → sender buat resolve reply
-                            senders: dict = {}
+                            senders = {}
                             lines = []
                             _me_id = getattr(await client.get_me(), "id", 0)
                             for m in reversed(msgs):  # kronologis
@@ -1576,6 +1578,12 @@ async def _run_agent(event):
                         except Exception:
                             return ""
 
+                    async def _group_history_provider(_chat_id: int) -> str:
+                        """History provider HANYA untuk grup. Private chat: skip."""
+                        if _chat_id >= 0:
+                            return ""
+                        return await _fetch_history(_chat_id)
+
                     reply_text = await asyncio.wait_for(
                         hermes_bridge.hermes_ask(
                             chat_id, sender_name, chat_title, text_for_agent,
@@ -1586,7 +1594,7 @@ async def _run_agent(event):
                             on_clarify=_on_clarify,
                             on_heartbeat=_on_heartbeat,
                             on_state=_on_state,
-                            history_provider=_fetch_history,
+                            history_provider=_group_history_provider,
                         ),
                         timeout=_hard_t,
                     )
@@ -1995,31 +2003,131 @@ async def main():
                 except Exception:
                     pass
                 try:
-                    msgs = await asyncio.wait_for(
-                        client.get_messages(chat_id, search=q, limit=limit), timeout=20)
+                    # ── FIX (19:10): MULTI-TERM OR search — Claude-style.
+                    # q bisa berisi beberapa istilah dipisah '|' (misal
+                    # "archimedez|aldo|bang aldo") — tiap term di-search
+                    # sendiri (Telethon search = literal), hasil digabung +
+                    # dedupe by msg_id + diurutkan kronologis. Ini bikin
+                    # agent bisa cari variasi nama/julukan/sinonim dalam
+                    # SATU panggilan API, bukan cuma 1 kata kunci literal.
+                    # ── FIX (19:35): KONTEKS SEKITAR MATCH (Claude-style).
+                    # Tiap match di-expand: 2 pesan sebelum + 2 sesudah
+                    # (window ±2) biar agent liat ALUR obrolan, bukan
+                    # potongan terisolasi. Kalau match itu reply → sertakan
+                    # pesan induknya (reply-chain expansion). Fetch konteks
+                    # paralel + dibatasi max 12 match (anti rate-limit).
+                    _terms = [t.strip() for t in q.split("|") if t.strip()] or [q]
+                    _per_term = max(1, int(limit / len(_terms)) + 1)
+                    _found = {}  # msg_id -> line
+                    for _t in _terms:
+                        try:
+                            _msgs = await asyncio.wait_for(
+                                client.get_messages(chat_id, search=_t, limit=_per_term),
+                                timeout=20)
+                        except Exception:
+                            continue
+                        for m in reversed(_msgs or []):
+                            if not m or m.message is None:
+                                continue
+                            _found[m.id] = m
+                    # ── ambil konteks sekitar tiap match (paralel, cap 12)
+                    async def _ctx_window(mid: int) -> dict:
+                        """2 sebelum + 2 sesudah + parent reply."""
+                        out = {"before": [], "after": [], "parent": None}
+                        try:
+                            _w = await asyncio.wait_for(
+                                client.get_messages(chat_id, min_id=mid - 3, max_id=mid + 3),
+                                timeout=15)
+                            for _m in (_w or []):
+                                if not _m or _m.id == mid or _m.message is None:
+                                    continue
+                                _line = (_m.message or "").strip()[:150]
+                                if not _line:
+                                    continue
+                                _nm = "?"
+                                try:
+                                    _ent = await client.get_entity(_m.sender_id) if _m.sender_id else None
+                                    _nm = (getattr(_ent, "first_name", "") or getattr(_ent, "title", "") or str(_m.sender_id))[:16]
+                                except Exception:
+                                    _nm = str(_m.sender_id)[:8]
+                                if _m.id < mid:
+                                    out["before"].append(f"[{_fmt_ts(_m.date)}] {_nm}: {_line}")
+                                else:
+                                    out["after"].append(f"[{_fmt_ts(_m.date)}] {_nm}: {_line}")
+                        except Exception:
+                            pass
+                        return out
+
+                    async def _parent_msg(m: object) -> str:
+                        """Kalau m itu reply, ambil teks pesan induknya."""
+                        try:
+                            _pid = m.reply_to.reply_to_msg_id if m.reply_to else None
+                            if not _pid:
+                                return ""
+                            _p = await asyncio.wait_for(
+                                client.get_messages(chat_id, ids=_pid), timeout=15)
+                            if not _p or _p.message is None:
+                                return ""
+                            _pt = (_p.message or "").strip()[:150]
+                            if not _pt:
+                                return ""
+                            _nm = "?"
+                            try:
+                                _ent = await client.get_entity(_p.sender_id) if _p.sender_id else None
+                                _nm = (getattr(_ent, "first_name", "") or getattr(_ent, "title", "") or str(_p.sender_id))[:16]
+                            except Exception:
+                                _nm = str(_p.sender_id)[:8]
+                            return f"[{_fmt_ts(_p.date)}] {_nm}: {_pt}"
+                        except Exception:
+                            return ""
+
+                    _ids = sorted(_found.keys())
+                    _ctx_targets = _ids[:_ctx_max] if (_ctx_max := 12) >= 0 else _ids
+                    _ctxs = {}
+                    if _ctx_targets:
+                        _res = await asyncio.gather(
+                            *[_ctx_window(i) for i in _ctx_targets],
+                            return_exceptions=True)
+                        _pres = await asyncio.gather(
+                            *[_parent_msg(_found[i]) for i in _ctx_targets],
+                            return_exceptions=True)
+                        for _i, _mid in enumerate(_ctx_targets):
+                            _c = _res[_i] if not isinstance(_res[_i], Exception) else {"before": [], "after": [], "parent": None}
+                            _c["parent"] = _pres[_i] if not isinstance(_pres[_i], Exception) else ""
+                            _ctxs[_mid] = _c
+
+                    results = []
+                    for _mid in _ids:
+                        m = _found[_mid]
+                        txt = (m.message or "").strip()[:200]
+                        if not txt:
+                            continue
+                        name = "?"
+                        try:
+                            ent = await client.get_entity(m.sender_id) if m.sender_id else None
+                            name = (getattr(ent, "first_name", "") or getattr(ent, "title", "") or str(m.sender_id))[:20]
+                        except Exception:
+                            name = str(m.sender_id)[:8]
+                        ts = _fmt_ts(m.date)
+                        rep = ""
+                        try:
+                            if m.reply_to and getattr(m.reply_to, "reply_to_msg_id", None):
+                                rep = " (reply)"
+                        except Exception:
+                            pass
+                        line = f"[{ts}]{rep} {name} (id={m.id}): {txt}"
+                        _c = _ctxs.get(_mid)
+                        if _c:
+                            if _c["parent"]:
+                                line += f"\n    ↳ REPLY KE: {_c['parent']}"
+                            for _b in _c["before"][-2:]:
+                                line += f"\n    ↖ SEBELUM: {_b}"
+                            for _a in _c["after"][:2]:
+                                line += f"\n    ↳ SESUDAH: {_a}"
+                        results.append(line)
+                    results = results[:limit]
                 except Exception as e:
                     return _web.json_response({"error": f"search gagal: {e}"}, status=500)
-                results = []
-                for m in reversed(msgs or []):
-                    if not m or m.message is None:
-                        continue
-                    txt = (m.message or "").strip()[:200]
-                    if not txt:
-                        continue
-                    name = "?"
-                    try:
-                        ent = await client.get_entity(m.sender_id) if m.sender_id else None
-                        name = (getattr(ent, "first_name", "") or getattr(ent, "title", "") or str(m.sender_id))[:20]
-                    except Exception:
-                        name = str(m.sender_id)[:8]
-                    ts = _fmt_ts(m.date)
-                    rep = ""
-                    try:
-                        if m.reply_to and getattr(m.reply_to, "reply_to_msg_id", None):
-                            rep = " (reply)"
-                    except Exception:
-                        pass
-                    results.append(f"[{ts}]{rep} {name} (id={m.id}): {txt}")
                 return _web.json_response({
                     "query": q, "count": len(results), "results": results,
                     "chat_type": chat_type, "chat_username": chat_uname,

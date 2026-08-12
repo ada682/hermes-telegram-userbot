@@ -26,7 +26,7 @@ SESSION_FILE = os.environ.get("UB_SESSION", "ubot")  # set via env
 
 # ── LLM backend (OpenAI-compatible). Default: reuse backend Hermes.
 BASE_URL = os.environ.get("UB_BASE_URL", "https://inference-api.nousresearch.com/v1").rstrip("/")
-API_KEY = os.environ.get("UB_API_KEY", "")  # set via env
+API_KEY = (
     os.environ.get("UB_API_KEY")
     or os.environ.get("HERMES_CUSTOM_INFERENCE_API_NOUSRESEARCH_COM_API_KEY")
     or ""

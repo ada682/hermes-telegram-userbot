@@ -142,9 +142,14 @@ BRIDGE_PROMPT = (
     "akui aja 'nggak tau' — JANGAN mengarang atau menebak. Kalau pertanyaannya ambigu, "
     "minta klarifikasi singkat. "
     "History obrolan chat ini tersimpan di {sandbox}/.hermes/history.md (rolling 100 "
-    "baris — semua pesan ke-record). Kalau pertanyaan user soal obrolan SEBELUMNYA, "
-    "member grup, admin, owner, atau sesuatu yang butuh konteks chat lama — BACA dulu "
-    "file itu (read_file) sebelum jawab. Jangan baca kalau nggak perlu. "
+    "baris — semua pesan ke-record). HEADER file itu berisi owner/admin dan title "
+    "anggota — jangan coba tebak atau mengarang. "
+    "Di GRUP: kalau butuh konteks chat lama, member, admin, owner, atau title — "
+    "BACA file itu dengan read_file sebelum jawab. "
+    "Di PRIVATE: JANGAN BACA history.md — konteks private cuma dari wake-up "
+    "message + session kamu sendiri. "
+    "Jangan inject isinya ke jawaban, pakai hanya untuk konteks. "
+    "Jangan baca kalau nggak perlu. "
     "Pakai bahasa yang sama dengan pesan masuk (kalau Indonesia, gaya santai/slang). "
     "Kalau seseorang nanya langsung 'lu AI?/lu bot?/ini balesan otomatis?', jawab "
     "jujur tapi santai, nggak usah panjang. "
@@ -201,6 +206,23 @@ BRIDGE_PROMPT = (
     "ini). SEMANTIC + CONTEXT-AWARE SEARCH: sebelum search, baca 20-30 "
     "pesan terakhir dari history.md grup/chat ini buat paham konteks NOW — "
     "apakah obrolan lagi santai/ngobrol doang atau ngarah ke topik grup. "
+    "VARIASI KEYWORD (Claude-style): JANGAN cuma search 1 kata kunci literal "
+    "yang user bilang — generate 3-6 variasi dulu (nama asli, panggilan, "
+    "julukan, username/@handle, ejaan alternatif, singkatan, sinonim topik), "
+    "lalu kirim SEMUA variasi dalam SATU panggilan dipisah '|' (contoh: "
+    "history_search.py 'archimedez|aldo|bang aldo|archi' <chat_id>). Backend "
+    "nyari tiap istilah dan gabung hasilnya. Kalau hasil masih kurang, "
+    "reformulasi: pake istilah yang lebih pendek/umum atau angle lain. "
+    "JANGAN NYERAH CEPAT: kalau hasil KOSONG, jangan langsung bilang 'nggak "
+    "ada' — coba minimal 3-4 angle berbeda dulu (nama asli, panggilan, "
+    "julukan, @username, topik umum, kata kunci alternatif, istilah lebih "
+    "pendek) sebelum menyimpulkan. Baru kalau SEMUA angle udah dicoba dan "
+    "tetap kosong → bilang 'nggak nemu di history chat' dengan jujur. "
+    "Hasil search sekarang berisi KONTEKS SEKITAR: baris '↖ SEBELUM' / "
+    "'↳ SESUDAH' = pesan di sekitar match (baca untuk paham ALUR obrolan), "
+    "baris '↳ REPLY KE' = pesan induk dari reply-chain (sering berisi info "
+    "kunci). Gunakan konteks ini untuk menjawab — jangan cuma baca baris "
+    "match-nya doang. "
     "Interpretasikan keyword ambigu SESUAI konteks chat saat ini, BUKAN "
     "asumsi konteks grup. Contoh: grup trading tapi lagi bahas 'micin' "
     "sebagai jajanan → jangan interpretasi sebagai coin. Kalau keyword "
@@ -319,7 +341,10 @@ BRIDGE_PROMPT = (
     "Kalau cuma ngobrol, balas santai aja. "
     "JANGAN baca, tulis, atau sebut-sebut apa pun di luar {sandbox}. "
     "KALAU BUTUH FILE TEMP/SCRIPT/LOG (verifikasi, snapshot, output tool) — taruh "
-    "di DALAM workspace ({sandbox}), JANGAN di /tmp atau folder luar lain. "
+    "di DALAM workspace ({sandbox}), JANGAN di /tmp sistem atau folder luar lain. "
+    "Buat subfolder tersendiri misal ./tmp/ atau ./logs/ DI DALAM sandbox — biar "
+    "semua kerjaan FOKUS di sandbox doang. Contoh: {sandbox}/tmp/verify.py. Kalau "
+    "file temp udah gak dipake, hapus. "
     "Contoh: /srv/ubox/groups/<id>/logs/ atau folder kerja. " 
     "PENTING: kalau jalanin script/command yang LAMA atau daemon/monitoring "
     "(bot, watcher, loop, server) — JANGAN block terminal: pakai background "
@@ -817,6 +842,39 @@ async def _has_session(name: str) -> bool:
     return proc.returncode == 0
 
 
+async def _ensure_session_healthy(name: str) -> bool:
+    """Health-check: tmux session exists AND has an active Hermes CLI process.
+
+    Returns True if session is healthy, False if recovery is needed.
+    """
+    if not await _has_session(name):
+        return False
+    try:
+        out, _ = await _run("list-sessions", "-F", "#{session_name} #{session_pid}")
+        target = f"{name} "
+        found = any(line.startswith(target) for line in out.splitlines() if line.strip())
+        if found:
+            return True
+        out2, _ = await _run("capture-pane", "-p", "-S", "-20", "-t", name)
+        return "❯" in (out2[-400:] if out2 else "")
+    except Exception:
+        return False
+
+
+async def _recover_session(chat_id: int, context: str) -> str:
+    """Kill unhealthy session and respawn."""
+    name = _session_name(chat_id, context)
+    try:
+        await _run("kill-session", "-t", name)
+    except Exception:
+        pass
+    _session_ready.pop(name, None)
+    _session_used.pop(name, None)
+    _sessions.pop(f"{chat_id}:{context}", None)
+    log.warning("recover session: respawn %s untuk %s", name, chat_id)
+    return await _spawn_session(chat_id, context)
+
+
 # ── FIX (14:05): session tmux ADA ≠ CLI SIAP. Pre-warm spawn tmux → CLI
 # boot 2-3 menit — pesan yang masuk di tengah boot ketemu session "ada" →
 # prompt DITELAN CLI yang belum siap → gagal terus. Registry ready:
@@ -908,7 +966,35 @@ async def _spawn_session(chat_id: int, context: str = "") -> str:
 async def _send_message(name: str, text: str) -> None:
     # newline → spasi biar send-keys aman
     flat = " ".join(text.splitlines())
-    await _run("send-keys", "-t", name, "-l", flat)
+    # ── FIX (18:30): tmux send-keys punya batas ~16KB per command
+    # (MAX_CMDLEN) — teks >16KB bytes (BRIDGE_PROMPT 15.4KB + unicode
+    # UTF-8 3-4 byte/char = bisa 18KB+ bytes) → "command too long" →
+    # prompt ke-drop DIAM-DIAM (rc!=0 di-ignore!). Bukti: Fajar 197s
+    # stuck, prompt nggak pernah muncul di pane, padahal rc=0.
+    # Fix: teks kecil → send-keys; teks besar → tmux load-buffer (via
+    # stdin pipe, TIDAK kena batas argumen) + paste-buffer ke pane.
+    _size = len(flat.encode("utf-8"))
+    if _size <= 14000:  # aman di bawah batas 16384 bytes
+        await _run("send-keys", "-t", name, "-l", flat)
+    else:
+        try:
+            _proc = await asyncio.create_subprocess_exec(
+                *_TMUX, "load-buffer", "-",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=_sandbox_env(),
+            )
+            await asyncio.wait_for(_proc.communicate(flat.encode("utf-8")), timeout=20)
+            _pb = await _run("paste-buffer", "-t", name, "-d", "-p")
+            if _pb and _pb[1] and "error" in _pb[1].lower():
+                raise RuntimeError(f"paste-buffer gagal: {_pb[1][:80]}")
+        except Exception as _e:
+            log.warning("paste-buffer gagal (%s) — fallback chunk send-keys", _e)
+            # fallback: chunk per 10KB (send-keys masih bisa kena batas
+            # kalau chunk-nya unicode-padat, tapi ini jalan terakhir)
+            for _i in range(0, len(flat), 10000):
+                await _run("send-keys", "-t", name, "-l", flat[_i:_i + 10000])
     await _run("send-keys", "-t", name, "Enter")
 
 
@@ -1291,7 +1377,9 @@ async def hermes_ask(chat_id: int, sender_name: str, chat_title: str, text: str,
     # bikin response contamination antar user.
     lock = _get_session_lock(s_key)
     if chat_id >= 0:
-        if lock.locked() and _busy_owner.get(s_key) == user_id:
+        _sname = _sessions.get(s_key) or _session_name(chat_id, context)
+        _tmux_ok = bool(_sname and await _has_session(_sname))
+        if _tmux_ok and lock.locked() and _busy_owner.get(s_key) == user_id:
             try:
                 await _steer_session(s_key, text)
                 _steered_run[s_key] = True  # run ini ke-steer → final reply pesan BARU
@@ -1324,6 +1412,11 @@ async def hermes_ask(chat_id: int, sender_name: str, chat_title: str, text: str,
         _apply_context_overrides(context)  # override SOUL/USER/MEMORY/skills per konteks
         name = _session_name(chat_id, context)
 
+        if await _has_session(name) and not await _ensure_session_healthy(name):
+            log.warning("session %s unhealthy — auto recovery", name)
+            name = await _recover_session(chat_id, context)
+            _sessions[s_key] = name
+
         # ── latency instrumentation: tiap fase hermes_ask() tercatat
         _latency_name = name
         _latency_t0 = time.monotonic()
@@ -1337,15 +1430,9 @@ async def hermes_ask(chat_id: int, sender_name: str, chat_title: str, text: str,
 
         if await _has_session(name):
             is_new = not _session_used.get(name)
-            # ── FIX (14:05): session ADA tapi CLI belum SIAP (pre-warm masih
-            # boot 2-3 menit!) → TUNGGU flag ready, JANGAN kirim prompt ke CLI
-            # yang booting (promptnya ditelan → gagal terus).
             if not _is_session_ready(name):
                 log.info("session %s belum ready (boot) — tunggu...", name)
-                # ── FIX: lazy queue — session belum ready? jangan nunggu 3.5 menit.
-                # Queue pesan via _pending_retry, delivery check yang proses pas
-                # boot kelar. User dapat '⏳ Working..' instan, bukan delay 105s.
-                for _ in range(10):  # max 10s wait — cukup buat session yang hampir ready
+                for _ in range(10):
                     if _is_session_ready(name):
                         break
                     await asyncio.sleep(1)
@@ -1381,7 +1468,12 @@ async def hermes_ask(chat_id: int, sender_name: str, chat_title: str, text: str,
         # CLI masih boot!). Session pre-warmed (flag ready — CLI udah siap di
         # startup) → LANGSUNG prompt (kayak grup — tanpa probe, tanpa race
         # pong-box-render yang bikin prompt ke-swallow!).
-        if is_new and not _is_session_ready(name):
+        # ── FIX 2 (18:12): probe UNTUK SEMUA is_new — pre-warmed session punya
+        # _session_ready=True TAPI agent belum di-init (HERMES_DEFER_AGENT_STARTUP
+        # =1 — import berat di-defer ke pesan pertama!). Prompt yang dikirim ke
+        # CLI yang masih welcome screen = ke-swallow (197s stuck, bukti: Fajar).
+        # Probe ping → pong memicu agent init → CLI beneran siap → prompt aman.
+        if is_new:
             try:
                 _pb = extract_reply(await _capture(name))  # baseline box (banner!)
                 await _send_message(name, "ping")
@@ -1746,7 +1838,10 @@ async def reset_sessions() -> int:
         _backfilled.clear()
         killed = 0
         for s_key, name in list(_sessions.items()):
-            await _run("kill-session", "-t", name)
+            try:
+                await _run("kill-session", "-t", name)
+            except Exception:
+                pass
             _sessions.pop(s_key, None)
             killed += 1
         # cleanup session yang nyangkut (nama ub_*)
@@ -1754,7 +1849,10 @@ async def reset_sessions() -> int:
         for line in out.splitlines():
             sname = line.strip()
             if sname.startswith("ub_"):
-                await _run("kill-session", "-t", sname)
-                _sessions.pop(sname, None)
-                killed += 1
+                try:
+                    await _run("kill-session", "-t", sname)
+                except Exception:
+                    pass
+        _session_ready.clear()
+        _session_used.clear()
         return killed

@@ -45,7 +45,7 @@ This userbot turns your Telegram account into an **AI agent on autopilot**. Inst
 | 📜 **Group history context** | New session = backfilled with the last N group messages (`GROUP_BACKFILL`, default 50) + a header with the **group owner, admin list & custom admin titles**; all non-`SONNET` chatter is tracked in a rolling `history.md` (100 lines, FIFO) and injected as *observed context* (agent knows the group's conversation, only replies to requests) |
 | 🔍 **History search tool** | Agent can search the full Telegram chat history (beyond the rolling window) via `scripts/history_search.py '<query>' <chat_id>` — returns timestamped results with message IDs; agent builds `t.me/<username>/<id>` or `t.me/c/<id>/<id>` links (format depends on chat type) |
 | 🚀 **Session pre-warm + reaper** | Known group/private sessions spawn warm at startup (background — no CLI boot lag on the first message; list from `PREWARM_CHATS` + auto-tracked `seen_chats`); idle sessions are killed after `SESSION_IDLE_KILL` (default 1800s) to free RAM |
-| 🎭 **Stickers** | Agent replies `STICKER_PACK:<pack>` → sends a sticker from the configured pack as a separate message; `.webp`/`.tgs` via `MEDIA:` also send as stickers |
+| 🎭 **Stickers** | Agent replies `STICKER:` (random) or `STICKER: <emoji>` → sends the account's **favorite sticker** as a separate message; `.webp`/`.tgs` via `MEDIA:` also send as stickers |
 | 🎬 **Video** | `MEDIA:/path/video.mp4` → delivered as an inline video; `.gif` as animation |
 | 🛑 **/stop** | `STOP` / `stop` / `berhenti` → cancels the in-flight run (Ctrl+C to the CLI) — session/context stays alive, like Hermes |
 | ⏳ **Working heartbeat** | Runs longer than 60s → `⏳ Working — N min — iteration X/150` status bubble (edited in place), removed when the reply streams |
@@ -55,27 +55,6 @@ This userbot turns your Telegram account into an **AI agent on autopilot**. Inst
 | 🌍 **Multilingual** | Agent auto-replies in the language of the incoming message |
 | 🛡️ **Danger filter** | Destructive requests blocked before they ever reach the agent |
 | ⏱️ **Hermes-style recovery** | Provider hiccups retried with continuation + fallback chain; **no hard watchdog** (default `HERMES_HARD_TIMEOUT=0`) — the CLI's own recovery (stream-drop continuation, fallback provider, thinking-budget handling) runs to completion exactly like Hermes; `HERMES_TIMEOUT=600` idle detection as the only safety net |
-
----
-
-## 🎭 Sticker Packs
-
-Sticker packs are configured via `sticker_packs.json` — no code changes needed to add or swap packs.
-
-### STICKER Usage
-
-User sends: `(your_wake_up_call) sticker meme`
-Agent automatically maps to the configured pack and replies with `STICKER_PACK:memev2`.
-
-### Adding a New STICKER Pack
-
-1. Open `sticker_packs.json`
-2. Add a new entry:
-   ```json
-   "nama_alias": "shortname_pack_telegram"
-   ```
-3. Restart the userbot
-4. Users can immediately use: ` (your_wake_up_call) sticker nama_alias`
 
 ---
 
@@ -111,10 +90,27 @@ Telegram ──▶ main.py (Telethon)
 
 ## 🚀 Setup
 
+> ⚡ **Cara TERCEPAT (recommended): pakai Hermes kamu sendiri buat setup.**
+> Copy repo ini, terus kirim instruksi ini ke Hermes kamu:
+
+```
+Setup project telegram-userbot ini di server. Ikuti langkah setup.sh / README,
+tapi pakai AI-mu sendiri: baca setup.sh + README.md + config.py, terus kerjain
+semua yang dibutuhin (sandbox user, config.yaml, .env, login, systemd). Aku
+tinggal kasih TG_API_ID, TG_API_HASH, dan API key provider — sisanya urus
+sendiri, jangan tanya yang bisa lu cek sendiri.
+```
+
+Hermes kamu akan: baca `setup.sh`, bikin user `ubox`, seed `/srv/ubox/.hermes/`,
+set `config.yaml` ke provider model yang lu punya, bantu `login.py`, dan daftarin
+systemd service. Kamu cuma perlu isi 3 kredensial.
+
+---
+
 ### 1. Install
 
 ```bash
-git clone https://github.com/ada682/hermes-telegram-userbot.git && cd telegram-userbot
+git clone <your-repo-url> && cd telegram-userbot
 pip3 install -r requirements.txt
 ```
 
@@ -200,12 +196,12 @@ sudo systemctl enable --now userbot
 | **Voice note** | `SONNET vn dong <ask>` or `SONNET bikin vn ini teksnya "..."` |
 | **Transcribe a voice note** | send a voice note with caption `SONNET <anything>` → audio is transcribed + included |
 | **Get a file** | ask for a script/report → agent writes it → `MEDIA:/path` delivers it |
-| **Switch persona** | `SONNET persona breach` / `persona default` → `/personality` applied live to the session |
+| **Switch persona** | `SONNET persona breach` (any personality in the sandbox config) — `persona default` resets |
 | **Answer an agent question** | when you see `❓ ...`, just reply with the number or text — no wake word needed |
 | **Long-running tasks** | watch for `⏳ Working — N min` while the agent works |
 | **Cancel a task** | type `STOP` (or `stop` / `berhenti`) mid-run → in-flight work is cancelled, context stays |
 | **Search past chat** | `SONNET waktu itu kita bahas <X>?` → agent runs `scripts/history_search.py` and answers from the actual Telegram history (not its own memory); ask for the links → it replies with `t.me/...` message links |
-| **Get a sticker** | `SONNET kirim stiker <something>` → agent replies `STICKER_PACK:<pack>` and the sticker from the configured pack lands as a separate bubble |
+| **Get a sticker** | `SONNET kirim stiker <something>` → agent replies `STICKER:` and the account's favorite sticker lands as a separate bubble |
 | **Send a video** | ask for a video file → agent writes it → `MEDIA:/path/video.mp4` delivers as inline video |
 
 ---
@@ -226,7 +222,6 @@ sudo systemctl enable --now userbot
 main.py             — Telegram handler (streaming, VN, filters, cooldown, media, history/backfill, pre-warm, reaper)
 hermes_bridge.py    — spawn/poll Hermes CLI sessions, tool bubbles, HTML formatting, history provider
 config.py           — all configuration via env vars
-sticker_packs.json  — sticker pack mappings (alias → Telegram shortname)
 scripts/history_search.py — agent tool: search full Telegram chat history (via userbot API :9101)
 login.py            — create the Telegram session
 .env.example        — config template (all placeholders, zero credentials)
