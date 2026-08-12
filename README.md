@@ -110,7 +110,7 @@ systemd service. Kamu cuma perlu isi 3 kredensial.
 ### 1. Install
 
 ```bash
-git clone <your-repo-url> && cd telegram-userbot
+git clone https://github.com/ada682/hermes-telegram-userbot.git && cd telegram-userbot
 pip3 install -r requirements.txt
 ```
 
