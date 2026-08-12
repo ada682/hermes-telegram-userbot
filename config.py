@@ -20,9 +20,9 @@ def load_dotenv(path=".env"):
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 # ── Telegram API credentials (ambil dari https://my.telegram.org → API development tools)
-API_ID = os.environ.get("TG_API_ID", "")  # set via env
-API_HASH = os.environ.get("TG_API_HASH", "")  # set via env
-SESSION_FILE = os.environ.get("UB_SESSION", "ubot")  # set via env
+API_ID = int(os.environ.get("TG_API_ID", "0"))
+API_HASH = os.environ.get("TG_API_HASH", "")
+SESSION_FILE = os.environ.get("SESSION_FILE", "ubot")  # set via env
 
 # ── LLM backend (OpenAI-compatible). Default: reuse backend Hermes.
 BASE_URL = os.environ.get("UB_BASE_URL", "https://inference-api.nousresearch.com/v1").rstrip("/")
@@ -59,12 +59,19 @@ GROUP_BACKFILL = int(os.environ.get("UB_GROUP_BACKFILL", "50"))  # history grup 
 HISTORY_ROLLING = int(os.environ.get("UB_HISTORY_ROLLING", "100"))  # rolling window history.md (baris)
 SESSION_IDLE_KILL = int(os.environ.get("UB_SESSION_IDLE_KILL", "1800"))  # session CLI di-kill kalau idle > N detik (0 = mati) — biar RAM aman kalau banyak chat
 REQUIRE_PREFIX = os.environ.get("UB_REQUIRE_PREFIX", "").strip()  # wake word: cuma bales kalau pesan DIAWALI kata ini (misal SONNET). Kosong = bales semua (aturan lama).
+# ── MERGE WINDOW (detik): KHUSUS PRIVATE CHAT (chat_id > 0). Telegram
+# auto-split pesan panjang jadi beberapa bubble (<1 detik antar bubble).
+# Bubble berurutan dari user yang sama dalam window ini digabung jadi SATU
+# prompt — biar agent lihat pesan UTUH, bukan potongan, dan bubble 2/3
+# (tanpa wake word) nggak ke-skip. Bubble PERTAMA tetap harus pakai wake
+# word. Default 2.5s. 0 = mati.
+MERGE_WINDOW = float(os.environ.get("UB_MERGE_WINDOW", "2.5"))
 # state file buat persist toggle /switch_on / /switch_off (dan .on/.off)
 STATE_FILE = os.environ.get("UB_STATE_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json"))
 
 # ── Voice note (ElevenLabs TTS): kalau user minta "voice note", reply-nya
 # dikonversi jadi VN (.ogg) pake API ini.
-ELEVENLABS_API_KEY = os.environ.get("UB_API_KEY", "")  # set via env
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "").strip()
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "cgSgspJ2msm6clMCkdW9")
 ELEVENLABS_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_flash_v2_5")
 ELEVENLABS_VOLUME = float(os.environ.get("ELEVENLABS_VOLUME", "0.85"))  # 1.0 = asli, 0.85 = agak pelan
@@ -83,18 +90,6 @@ SANDBOX_USERS = os.environ.get("UB_SANDBOX_USERS", "/srv/ubox/users")  # per-use
 SANDBOX_GROUPS = os.environ.get("UB_SANDBOX_GROUPS", "/srv/ubox/groups")  # per-grup sandbox: session + memory SHARED antar user di grup yang sama
 HISTORY_LEN = int(os.environ.get("UB_HISTORY", "12"))     # jumlah pesan konteks yang diingat per chat
 CMD_PREFIX = os.environ.get("UB_CMD_PREFIX", ".ub")       # perintah dari akun sendiri
-STICKER_PACKS = {
-    "scuba": ["scuba", "diving", "diver", "selam"],
-    "cewe": ["girl", "woman", "cewek", "cewe", "cantik", "beautiful", "cute"],
-    "kucing": ["cat", "kucing", "meow", "kitty", "kitten"],
-    "kucingv2": ["cat", "kucing", "meow", "kitty", "kitten"],
-    "spongebob": ["spongebob", "bob", "sponge", "patrick", "starfish"],
-    "kucingv3": ["cat", "kucing", "meow", "kitty", "kitten", "tiktok"],
-    "crypto": ["crypto", "bitcoin", "money", "monkey", "ape", "diamond"],
-    "meme": ["meme", "funny", "lol", "haha", "joke", "comedy"],
-    "memev2": ["meme", "funny", "lol", "haha", "joke", "comedy"],
-}
-
 DANGER_PHRASE = os.environ.get(
     "UB_DANGER_PHRASE",
     "gua tolak jing kontoljuga lu ya",

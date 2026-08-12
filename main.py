@@ -841,6 +841,49 @@ enabled = _load_enabled()
 disabled_users = _load_disabled_users()
 self_trigger = _load_self_trigger()
 
+# ── MERGE WINDOW BUFFER: Telegram auto-split pesan panjang jadi beberapa
+# bubble (<1 detik antar bubble). Buffer per (chat_id, user_id): bubble
+# berurutan dalam MERGE_WINDOW detik digabung jadi SATU prompt utuh, biar
+# agent lihat pesan lengkap bukan potongan (dan bubble 2/3 tanpa wake word
+# nggak ke-skip). Flush = sleep window → gabung parts → panggil _run_agent
+# dengan teks gabungan.
+_merge_buf = {}  # (chat_id, user_id) -> {"parts": [...], "last_event": event}
+
+
+async def _flush_merge(mk):
+    try:
+        await asyncio.sleep(config.MERGE_WINDOW)
+        item = _merge_buf.pop(mk, None)
+        if not item:
+            return
+        parts = [p for p in item["parts"] if p]
+        if not parts:
+            return
+        ev = item["last_event"]
+        merged = "\n\n".join(parts)
+        try:
+            await _run_agent(ev, _merged_text=merged)
+        except Exception:
+            pass  # error di-handle di dalam _run_agent
+    except Exception:
+        pass
+
+
+async def _is_reply_to_media(event) -> bool:
+    """True kalau event ini REPLY ke pesan yang punya media (gambar/file/
+    voice). Dipakai buat SKIP merge window — reply-to-media diproses
+    LANGSUNG (jangan ditunda 2.5s, jangan ke-merge sama bubble lain)."""
+    try:
+        if not getattr(event, "is_reply", False):
+            return False
+        _rep = await event.get_reply_message()
+        if _rep is None:
+            return False
+        return (_is_image_media(_rep) or _is_document_media(_rep)
+                or _is_voice(_rep))
+    except Exception:
+        return False
+
 def _save_enabled(v: bool) -> None:
     _save_state(v, disabled_users)
 
@@ -883,10 +926,12 @@ async def on_incoming(event):
 
     return await _run_agent(event)
 
-async def _run_agent(event):
+async def _run_agent(event, _merged_text=None):
     """Flow agent lengkap (resolve sender → media → hermes_ask → kirim reply).
     Dipanggil dari on_incoming (pesan masuk) ATAU on_self_command
-    (outgoing SONNET dari akun sendiri — self-trigger)."""
+    (outgoing SONNET dari akun sendiri — self-trigger).
+    _merged_text: dipanggil dari _flush_merge — teks sudah gabungan bubble,
+    langsung proses (skip wake word + merge logic)."""
     _run_t0 = time.monotonic()
     _chat_id = getattr(event, "chat_id", None)
     # Dulu typing di-line 909 — SETELAH event.get_sender() (line 827 — API
@@ -955,6 +1000,26 @@ async def _run_agent(event):
     if text.startswith(config.CMD_PREFIX):
         return  # perintah admin, ditangani handler lain
 
+    # ── MERGE WINDOW (private chat only): kalau ini bubble LANJUTAN dari
+    # pesan panjang yang ke-split Telegram → append ke buffer, tunggu flush.
+    # Bubble pertama tetap harus lolos wake word (di bawah) sebelum masuk
+    # buffer. Media (gambar/voice/doc) TIDAK di-merge — proses langsung.
+    # Reply-to-media JUGA di-skip (proses langsung, jangan ditunda).
+    _merge_key = (event.chat_id, getattr(sender, "id", 0))
+    _skip_merge = await _is_reply_to_media(event)
+    if (_merged_text is None and config.MERGE_WINDOW > 0
+            and event.chat_id > 0 and not _skip_merge
+            and not _is_image_media(event) and not _is_voice(event)
+            and not _is_document_media(event)):
+        _pending = _merge_buf.get(_merge_key)
+        if _pending is not None:
+            # bubble 2/3 — append, jangan proses sendiri
+            _pending["parts"].append(event.raw_text or "")
+            _pending["last_event"] = event
+            log.info("merge: bubble lanjutan di-append (total %s parts) chat=%s user=%s",
+                     len(_pending["parts"]), event.chat_id, getattr(sender, "id", 0))
+            return
+
     # ── Observed history: SEMUA pesan grup di-record ke history.md
     # (rolling 50) — agent tau obrolan grup walau bukan sonnet. Sonnet =
     # request; non-sonnet = observed context (inject delta pas hermes_ask).
@@ -966,7 +1031,8 @@ async def _run_agent(event):
         pass
 
     # ── Mode wake word: cuma bales kalau pesan DIAWALI prefix (misal "SONNET")
-    if config.REQUIRE_PREFIX:
+    _do_sticker_typing = False
+    if config.REQUIRE_PREFIX and _merged_text is None:
         stripped = text.strip()
         if not stripped.lower().startswith(config.REQUIRE_PREFIX.lower()):
             return  # bukan wake word — diem
@@ -975,6 +1041,48 @@ async def _run_agent(event):
         if not text.strip():
             return
         called = True
+        # ── MERGE: bubble PERTAMA lolos wake word → masuk buffer + schedule
+        # flush. Flush (setelah MERGE_WINDOW) gabung semua bubble → panggil
+        # _run_agent(_merged_text=...) → agent lihat pesan UTUH.
+        if (config.MERGE_WINDOW > 0 and event.chat_id > 0 and not _skip_merge
+                and not _is_image_media(event) and not _is_voice(event)
+                and not _is_document_media(event)):
+            _merge_buf[_merge_key] = {"parts": [text], "last_event": event}
+            asyncio.create_task(_flush_merge(_merge_key))
+            log.info("merge: bubble pertama masuk buffer chat=%s user=%s (flush %ss)",
+                     event.chat_id, getattr(sender, "id", 0), config.MERGE_WINDOW)
+            return
+        _do_sticker_typing = True
+    elif _merged_text is not None:
+        # pemanggilan dari flush — teks sudah gabungan
+        text = _merged_text
+        called = True
+        _do_sticker_typing = True
+    else:
+        # ── Aturan lama: "Apakah dipanggil?"
+        typing_task = _typing_task or asyncio.create_task(_keep_typing(event.chat_id))
+        try:
+            if event.is_private:
+                called = True
+            else:
+                called = False
+                if event.mentioned:
+                    called = True
+                if event.is_reply:
+                    reply = await event.get_reply_message()
+                    if reply is not None and reply.sender_id == me.id:
+                        called = True
+                raw = (event.raw_text or "").lower()
+                if me.username and f"@{me.username}".lower() in raw:
+                    called = True
+        except Exception:
+            typing_task.cancel()
+            return  # entity gagal — skip
+        if not called:
+            typing_task.cancel()
+            return
+
+    if _do_sticker_typing:
         # mark session busy SEBELUM media processing (gambar/voice download+OCR)
         # biar status queue/redirect muncul kalau user chat lagi pas proses media.
         try:
@@ -1010,32 +1118,30 @@ async def _run_agent(event):
             typing_task = asyncio.create_task(_keep_typing(event.chat_id))
         else:
             typing_task = _typing_task
-    else:
-        # ── Aturan lama: "Apakah dipanggil?"
-        typing_task = _typing_task or asyncio.create_task(_keep_typing(event.chat_id))
+
+    # ── Media dari REPLY: kalau event ini REPLY ke pesan yang punya file/
+    # gambar/voice, resolve pesan aslinya — agent bisa lihat file yang
+    # di-reply user ("sonnet coba lihat file ini" + reply ke file).
+    _media_src = event  # sumber media default: event itu sendiri
+    _media_from_reply = False
+    if (not _is_image_media(event) and not _is_document_media(event)
+            and not _is_voice(event)):
         try:
-            if event.is_private:
-                called = True
-            else:
-                called = False
-                if event.mentioned:
-                    called = True
-                if event.is_reply:
-                    reply = await event.get_reply_message()
-                    if reply is not None and reply.sender_id == me.id:
-                        called = True
-                raw = (event.raw_text or "").lower()
-                if me.username and f"@{me.username}".lower() in raw:
-                    called = True
-        except Exception:
-            typing_task.cancel()
-            return  # entity gagal — skip
-        if not called:
-            typing_task.cancel()
-            return
+            if getattr(event, "is_reply", False):
+                _rep = await event.get_reply_message()
+                if _rep is not None:
+                    _has_m = (_is_image_media(_rep) or _is_document_media(_rep)
+                              or _is_voice(_rep))
+                    if _has_m:
+                        _media_src = _rep
+                        _media_from_reply = True
+                        log.info("media dari reply pesan id=%s (chat=%s)",
+                                 getattr(_rep, "id", 0), event.chat_id)
+        except Exception as e:
+            log.warning("resolve media dari reply gagal: %s", e)
 
     # ── Media gambar → OCR + path buat VISION agent (kayak Hermes asli: coba liat dulu)
-    if _is_image_media(event):
+    if _is_image_media(_media_src):
         # 1) simpen di sandbox konteks biar agent bisa LIAT gambarnya (vision attachment)
         sandbox_path = None
         try:
@@ -1044,7 +1150,7 @@ async def _run_agent(event):
             folder = hermes_bridge._user_home(ctx)
             os.makedirs(folder, exist_ok=True)
             dl = await asyncio.wait_for(
-                event.download_media(file=os.path.join(folder, f"img_{event.id}.jpg")),
+                _media_src.download_media(file=os.path.join(folder, f"img_{event.id}.jpg")),
                 timeout=25,
             )
             if dl and os.path.exists(dl):
@@ -1058,7 +1164,7 @@ async def _run_agent(event):
         except Exception as e:
             log.warning("download media ke sandbox gagal: %s", e)
         # 2) OCR fallback (teks di gambar → konteks agent)
-        ocr = await _ocr_event_image(event)
+        ocr = await _ocr_event_image(_media_src)
         ocr_block = (
             f"\n\n[Gambar dari user — hasil OCR:\n{ocr}]"
             if ocr
@@ -1072,22 +1178,22 @@ async def _run_agent(event):
 
     # ── Dokumen/file (zip, .py, .exe, pdf, dll) → download ke sandbox konteks
     # biar agent bisa BACA/INSTALL. Path di-append ke prompt.
-    if _is_document_media(event):
+    if _is_document_media(_media_src):
         try:
             sender_id = getattr(event.sender_id, "id", event.sender_id) or event.chat_id
             ctx = hermes_bridge._resolve_context(event.chat_id, sender_id)
             folder = hermes_bridge._user_home(ctx)
             os.makedirs(folder, exist_ok=True)
-            doc = getattr(event, "document", None)
+            doc = getattr(_media_src, "document", None)
             name = None
             for a in (getattr(doc, "attributes", None) or []):
                 if getattr(a, "file_name", None):
                     name = a.file_name
                     break
             if not name:
-                name = f"file_{event.id}"
+                name = f"file_{getattr(_media_src, 'id', event.id)}"
             dest = os.path.join(folder, os.path.basename(name))
-            dl = await asyncio.wait_for(event.download_media(file=dest), timeout=120)
+            dl = await asyncio.wait_for(_media_src.download_media(file=dest), timeout=120)
             if dl and os.path.exists(dl):
                 import pwd
                 try:
@@ -1110,8 +1216,8 @@ async def _run_agent(event):
 
     # ── Voice note → STT transkrip (kayak Hermes: faster-whisper local).
     # Voice note + caption SONNET → di-transkrip, teksnya masuk konteks agent.
-    if _is_voice(event):
-        trans = await _transcribe_event_voice(event)
+    if _is_voice(_media_src):
+        trans = await _transcribe_event_voice(_media_src)
         if trans:
             text = (text + f"\n\n[Transkrip voice note dari user:\n{trans}]").strip()
         else:
