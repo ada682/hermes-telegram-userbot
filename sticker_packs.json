@@ -1,6 +1,6 @@
 {
   "placeholder": "blablabla",
   "placeholder1": "blablabla",
-  "placeholder2": "blabla",
-  /* add another if you want -- and delete this line */
+  "placeholder2": "blabla"
+  // add another if you want -- and delete this line
 }
