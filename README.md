@@ -54,9 +54,9 @@ This userbot turns your Telegram account into an **AI agent on autopilot**. Inst
 | ⏰ **Time-aware** | Every message is timestamped (WIB + morning/noon/evening/night) for the agent |
 | 🌍 **Multilingual** | Agent auto-replies in the language of the incoming message |
 | 🛡️ **Danger filter** | Destructive requests blocked before they ever reach the agent |
-| 🧠 **Per-chat model switching** | `.ub models <n>` ganti model per chat; `.ub models all <n>` ganti seluruh fleet (chat_models.json + config.yaml patch) |
-| 🛡️ **Auto-moderation** | Promo spam (Mt5, XyloMarket, Password Trading, ...) → mute + delete otomatis via `moderation.py` (0 credit); rules di `mod_rules.json` |
-| 🔄 **Forward detection** | Pesan forward di-tag `[PESAN FORWARD dari: @user/channel]` biar agent tau itu kiriman; rule moderasi bisa di-set `forward_from_channel: true` (cuma forward dari channel yang kena) |
+| 🧠 **Per-chat model switching** | `.ub models <n>` switches the model for that chat; `.ub models all <n>` switches the entire fleet (chat_models.json + config.yaml patch) |
+| 🛡️ **Auto-moderation** | Promo spam (Mt5, XyloMarket, Password Trading, ...) → auto mute + delete via `moderation.py` (0 credit); rules in `mod_rules.json` |
+| 🔄 **Forward detection** | Forwarded messages are tagged `[PESAN FORWARD dari: @user/channel]` so the agent knows it's a repost; moderation rules can set `forward_from_channel: true` (only channel forwards match) |
 | ⏱️ **Hermes-style recovery** | Provider hiccups retried with continuation + fallback chain; **no hard watchdog** (default `HERMES_HARD_TIMEOUT=0`) — the CLI's own recovery (stream-drop continuation, fallback provider, thinking-budget handling) runs to completion exactly like Hermes; `HERMES_TIMEOUT=600` idle detection as the only safety net |
 
 ---
@@ -93,20 +93,21 @@ Telegram ──▶ main.py (Telethon)
 
 ## 🚀 Setup
 
-> ⚡ **Cara TERCEPAT (recommended): pakai Hermes kamu sendiri buat setup.**
-> Copy repo ini, terus kirim instruksi ini ke Hermes kamu:
+> ⚡ **Fastest path (recommended): use your own Hermes to do the setup.**
+> Copy this repo, then send this instruction to your Hermes:
 
 ```
-Setup project telegram-userbot ini di server. Ikuti langkah setup.sh / README,
-tapi pakai AI-mu sendiri: baca setup.sh + README.md + config.py, terus kerjain
-semua yang dibutuhin (sandbox user, config.yaml, .env, login, systemd). Aku
-tinggal kasih TG_API_ID, TG_API_HASH, dan API key provider — sisanya urus
-sendiri, jangan tanya yang bisa lu cek sendiri.
+Set up this telegram-userbot project on the server. Follow setup.sh / README,
+but use your own AI: read setup.sh + README.md + config.py, then do everything
+that's needed (sandbox user, config.yaml, .env, login, systemd). I'll only
+provide TG_API_ID, TG_API_HASH, and a provider API key — handle the rest
+yourself, don't ask about things you can check yourself.
 ```
 
-Hermes kamu akan: baca `setup.sh`, bikin user `ubox`, seed `/srv/ubox/.hermes/`,
-set `config.yaml` ke provider model yang lu punya, bantu `login.py`, dan daftarin
-systemd service. Kamu cuma perlu isi 3 kredensial.
+Your Hermes will: read `setup.sh`, create the `ubox` user, seed
+`/srv/ubox/.hermes/`, set `config.yaml` to the model provider you have, run
+`login.py`, and register the systemd service. You only need to provide 3
+credentials.
 
 ---
 
@@ -160,9 +161,9 @@ nano .env   # isi TG_API_ID, TG_API_HASH, API_KEY (provider key)
 |---|---|---|
 | `TG_API_ID` | [my.telegram.org/apps](https://my.telegram.org/apps) | `12345678` |
 | `TG_API_HASH` | [my.telegram.org/apps](https://my.telegram.org/apps) | `abcdef0123456789abcdef0123456789` |
-| `API_KEY` | Provider LLM kamu (Nous / DeepSeek / OpenAI-compatible) | `sk-...` |
+| `API_KEY` | Your LLM provider (Nous / DeepSeek / OpenAI-compatible) | `sk-...` |
 
-Semua variable lain sudah ada default-nya di `.env.example` (tinggal di-uncomment kalau mau diubah). Wake word: set `REQUIRE_PREFIX=SONNET` biar bot cuma bales pesan yang diawali `SONNET` (kalau dibiarkan kosong, bot bales semua pesan).
+All other variables already have defaults in `.env.example` (just uncomment to change). Wake word: set `REQUIRE_PREFIX=SONNET` to make the bot only reply to messages starting with `SONNET` (leave it empty and the bot replies to everything).
 
 ### 5. Login to Telegram
 
@@ -194,9 +195,9 @@ sudo systemctl enable --now userbot
 |---|---|
 | **Wake word** | Bot replies only to messages starting with `SONNET` (config: `REQUIRE_PREFIX`) |
 | **Admin commands** | `.ub on` / `.ub off` / `.ub status` / `.ub reset` / `.ub models` / `.ub models <n>` / `.ub models all <n>` / `.ub tools active/inactive` / `.ub help` |
-| **Deep token analysis** | `SONNET bedah total CA ini 0x... pake beberapa agent` |
+| **Deep token analysis** | `SONNET deep analysis of this CA 0x... using multiple agents` |
 | **Multi-agent** | `SONNET <anything> use multiple agents` |
-| **Voice note** | `SONNET vn dong <ask>` or `SONNET bikin vn ini teksnya "..."` |
+| **Voice note** | `SONNET vn please <ask>` or `SONNET make a vn of this text "..."` |
 | **Transcribe a voice note** | send a voice note with caption `SONNET <anything>` → audio is transcribed + included |
 | **Get a file** | ask for a script/report → agent writes it → `MEDIA:/path` delivers it |
 | **Switch persona** | `SONNET persona breach` (any personality in the sandbox config) — `persona default` resets |
@@ -209,26 +210,27 @@ sudo systemctl enable --now userbot
 
 ---
 
-## 🧠 Model switching per-chat (`.ub models`)
+## 🧠 Per-chat model switching (`.ub models`)
 
-Ganti model agent **per chat** — tiap DM/grup bisa beda model, atau sekali jalan
-buat seluruh fleet:
+Switch the agent model **per chat** — each DM/group can run a different model,
+or switch the whole fleet in one command:
 
-| Command | Fungsi |
+| Command | Function |
 |---|---|
-| `.ub models` | list model + tandain (▶) yang aktif di chat ini |
-| `.ub models <nomor>` | ganti model **chat ini doang** (per-chat override) |
-| `.ub models all <nomor>` | ganti model **SEMUA user + grup** |
+| `.ub models` | list models + mark (▶) the one active in this chat |
+| `.ub models <number>` | switch the model for **this chat only** (per-chat override) |
+| `.ub models all <number>` | switch the model for **ALL users + groups** |
 
 Model list (`config.py` → `MODEL_LIST`):
 1. `deepseek-v4-pro` — DeepSeek V4 Pro
 2. `deepseek-v4-flash` — DeepSeek V4 Flash (default)
 
-Cara kerja: override disimpan di `chat_models.json` (per chat id) **dan**
-di-patch ke `model.default` di `config.yaml` sandbox chat itu — env `UB_MODEL`
-doang gak cukup, karena config sandbox yang set provider/model eksplisit
-menang (contoh: sandbox yang config-nya `stealth/ox-alpha`). Session di-kill &
-di-spawn ulang otomatis dengan model baru (0 downtime, spawn pas chat berikutnya).
+How it works: the override is stored in `chat_models.json` (per chat id) **and**
+patched into `model.default` in the chat sandbox's `config.yaml` — the
+`UB_MODEL` env var alone is not enough, because a sandbox config that sets an
+explicit provider/model wins (e.g. a sandbox whose config was
+`stealth/ox-alpha`). The session is killed & respawned automatically with the
+new model (0 downtime — spawns on the next message).
 
 ## 🎨 Sticker Packs (easy to add)
 
@@ -278,21 +280,22 @@ setup.sh            — one-shot installer (sandbox user + .env + seed templates
 
 ---
 
-## 🛡️ Moderation otomatis
+## 🛡️ Auto-moderation
 
-Deteksi promo di grup → **mute + delete otomatis**, jalan di `moderation.py`
-tanpa agent (0 credit, matching substring case-insensitive). Rules di
-`mod_rules.json` (master) / `/srv/ubox/groups/*/mod/mod_rules.json`:
+Promo spam detection in groups → **auto mute + delete**, handled by
+`moderation.py` without the agent (0 credit, case-insensitive substring
+matching). Rules live in `mod_rules.json` (master) /
+`/srv/ubox/groups/*/mod/mod_rules.json`:
 
 ```json
 {"pattern": "XyloMarket", "action": ["mute", "delete_all"], "scope": "chat_id_grup", "forward_from_channel": true}
 ```
 
-- `pattern` = kata kunci (case-insensitive, substring match)
-- `action` = `mute` (mute user) + `delete_all` (hapus semua pesan promo)
-- `forward_from_channel: true` = rule cuma jalan untuk pesan yang **di-forward dari channel** (ketik langsung gak kena)
-- Pesan forward juga di-tag `[PESAN FORWARD dari: ...]` biar agent tau itu kiriman, bukan teks asli sender
-- Owner (akun userbot) gak pernah kena moderasi
+- `pattern` = keyword (case-insensitive, substring match)
+- `action` = `mute` (mute the user) + `delete_all` (delete all promo messages)
+- `forward_from_channel: true` = rule only matches messages **forwarded from a channel** (directly typed messages are safe)
+- Forwarded messages are also tagged `[PESAN FORWARD dari: ...]` so the agent knows it's a repost, not the sender's own text
+- The owner (userbot account) is never moderated
 
 ## 🔒 Security Notes
 
