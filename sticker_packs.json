@@ -1,47 +1,13 @@
 {
-  "_comment": "Sticker pack config — user baru tinggal tambah pack di sini, TANPA edit kode. Format per pack: { 'set': '<short_name sticker set Telegram>', 'keywords': ['kata kunci', ...] }. Keywords dipakai buat perintah 'sticker <keyword>'. Setiap pack OTOMATIS punya keyword = nama pack-nya sendiri. Kalau format lama (string doang) juga masih didukung: 'scuba': 'itstank_by_fStikBot'.",
-  "scuba": {
-    "set": "itstank_by_fStikBot",
-    "keywords": ["scuba", "selam", "diving"]
-  },
-  "cewe": {
-    "set": "Vicidior",
-    "keywords": ["cewe", "cewek", "wanita", "girl"]
-  },
-  "kucing": {
-    "set": "hahahihi567_by_fStikBot",
-    "keywords": ["kucing", "cat", "meong"]
-  },
-  "kucingv2": {
-    "set": "enjaberryys_by_fStikBot",
-    "keywords": ["kucing2", "kucingv2"]
-  },
-  "spongebob": {
-    "set": "YangBroRasakanJrC1p0y",
-    "keywords": ["spongebob", "sponge", "bob"]
-  },
-  "kucingv3": {
-    "set": "TikTok_cats_animals",
-    "keywords": ["kucing3", "kucingv3", "catv3"]
-  },
-  "crypto": {
-    "set": "Swagsmonke",
-    "keywords": ["crypto", "kripto", "btc", "monke"]
-  },
-  "meme": {
-    "set": "video1725002678_by_Marin_Roxbot",
-    "keywords": ["meme", "memes"]
-  },
-  "memev2": {
-    "set": "Pler437",
-    "keywords": ["meme2", "memev2", "memev2"]
-  },
-  "nsfw": {
-    "set": "Bbgwithddk",
-    "keywords": ["nsfw", "dewasa"]
-  },
-  "patrick": {
-    "set": "Gokujawa_by_fStikBot",
-    "keywords": ["patrick", "star"]
-  }
+  "scuba": "itstank_by_fStikBot",
+  "cewe": "Vicidior",
+  "kucing": "hahahihi567_by_fStikBot",
+  "kucingv2": "enjaberryys_by_fStikBot",
+  "spongebob": "YangBroRasakanJrC1p0y",
+  "kucingv3": "TikTok_cats_animals",
+  "crypto": "Swagsmonke",
+  "patrick": "Gokujawa_by_fStikBot",
+  "meme": "video1725002678_by_Marin_Roxbot",
+  "memev2": "Pler437",
+  "nsfw": "Bbgwithddk"
 }
