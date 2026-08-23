@@ -164,18 +164,28 @@ def _extract_media(text: str):
 
 async def _send_media(event, paths) -> None:
     """Kirim file (MAX 2) yang di-sebut agent via MEDIA:/path.
-    .webp (512x512) + .tgs → dikirim sebagai STIKER (file_type='sticker')."""
+    .webp (512x512) + .tgs → dikirim sebagai STIKER (file_type='sticker').
+    FIX (19 Agu): timeout 30s terlalu pendek buat file gede (124MB butuh
+    ~2 menit upload) → timeout dihitung dari ukuran file: max(60, size/1MB*2)s.
+    """
     for p in (paths or [])[:2]:
         try:
             if os.path.exists(p):
                 _ext = p.rsplit(".", 1)[-1].lower() if "." in p else ""
+                # ── timeout proporsional ukuran: 2s per MB, min 60s, max 600s
+                _size_mb = 0
+                try:
+                    _size_mb = os.path.getsize(p) / (1024 * 1024)
+                except Exception:
+                    pass
+                _to = min(600, max(60, int(_size_mb * 2)))
                 if _ext in ("webp", "tgs"):
                     await asyncio.wait_for(
-                        event.reply(file=p, file_type="sticker"), timeout=30)
-                    log.info("stiker terkirim: %s", p)
+                        event.reply(file=p, file_type="sticker"), timeout=_to)
+                    log.info("stiker terkirim: %s (%.1fMB, %ss)", p, _size_mb, _to)
                 else:
-                    await asyncio.wait_for(event.reply(file=p), timeout=30)
-                    log.info("media terkirim: %s", p)
+                    await asyncio.wait_for(event.reply(file=p), timeout=_to)
+                    log.info("media terkirim: %s (%.1fMB, %ss)", p, _size_mb, _to)
             else:
                 await asyncio.wait_for(
                     event.reply(f"⚠️ File {p} nggak ketemu di sandbox.", link_preview=False),
@@ -440,6 +450,11 @@ async def _keep_typing(chat_id: int):
     from telethon.tl.functions.messages import SetTypingRequest
     from telethon.tl.types import SendMessageTypingAction
     logged = False
+    # ── FIX (13:00): SAFETY NET — typing task gak boleh hidup selamanya.
+    # Kalau ada jalur yang lupa cancel (bug _typing_task lokal di merge
+    # path — task A dari panggilan pertama gak pernah ke-cancel), typing
+    # berhenti sendiri setelah 10 menit. Sebelumnya: nyangkut 29+ menit.
+    _started = time.monotonic()
     try:
         # INSTANT typing: kirim sekarang sebelum loop, supaya user langsung lihat
         try:
@@ -452,6 +467,9 @@ async def _keep_typing(chat_id: int):
                 logged = True
         # loop renewal tiap 2 detik (< Telegram expire 5s)
         while True:
+            if time.monotonic() - _started > 600:  # 10 menit max
+                log.warning("keep_typing auto-stop chat=%s (10 menit — kemungkinan leak)", chat_id)
+                return
             try:
                 await client(
                     SetTypingRequest(peer=chat_id, action=SendMessageTypingAction())
@@ -463,6 +481,27 @@ async def _keep_typing(chat_id: int):
             await asyncio.sleep(2)
     except asyncio.CancelledError:
         pass
+
+
+# ── FIX (13:00): registry task typing PER-CHAT. Bug lama: _typing_task itu
+# variabel lokal per-panggilan _process_message — merge path bikin task di
+# panggilan pertama (lalu return), flush bikin task BARU di panggilan kedua
+# dan cuma cancel task itu → task pertama LEAK → typing nyala selamanya.
+# Sekarang semua task terdaftar di sini, cancel = bersihin SEMUA task chat itu.
+_typing_registry: dict = {}  # chat_id → set(task)
+
+def _typing_start(chat_id: int) -> "asyncio.Task":
+    _typing_stop(chat_id)
+    t = asyncio.create_task(_keep_typing(chat_id))
+    _typing_registry.setdefault(chat_id, set()).add(t)
+    return t
+
+def _typing_stop(chat_id: int):
+    for t in list(_typing_registry.pop(chat_id, set())):
+        try:
+            t.cancel()
+        except Exception:
+            pass
 
 def _elevenlabs_tts(text: str, out_ogg: str) -> bool:
     """ElevenLabs TTS → mp3 → ogg (voice note Telegram). Sinkron, jalan di
@@ -709,16 +748,40 @@ def _wants_voice_note(text: str) -> bool:
     return any(k in low for k in config.VN_KEYWORDS)
 
 def _extract_quoted_text(text: str):
-    """Ambil teks yang ke-quote (\"...\", '...', “...”) buat di-TTS langsung.
-    Return None kalau nggak ada quote."""
+    """Ambil teks yang ke-quote ("...", '...', “...”) buat di-TTS langsung.
+    Return None kalau nggak ada quote.
+    FIX (19 Agu): tambahin ekstraksi teks SETELAH keyword vn/voice — user
+    minta "vn i love you" / "vn bilang i love you" → TTS "i love you" doang
+    (bukan reply panjang agent)."""
     import re
     m = re.search(r"[\"“]([^\"”]{1,600})[\"”]", text)
     if m:
         return m.group(1).strip()
     # fallback: setelah kata "teksnya"/"textnya"/"baca ini"
-    m = re.search(r"(?:teksnya|textnya|baca ini|bacain)\s*[:\-]?\s*[“\"]?([^\"”]{1,600})[\"”]?", text, re.I)
+    m = re.search(r"(?:teksnya|textnya|baca ini|bacain)\s*[:\\-]?\s*[“\"]?([^\"”]{1,600})[\"”]?", text, re.I)
     if m:
         return m.group(1).strip()
+    # FIX (19 Agu): "vn <teks>" / "voice <teks>" / "vn bilang <teks>" /
+    # "vn yang <teks>" — teks setelah keyword VN (kalo ada) = yang mau di-TTS.
+    # JANGAN match kalau teksnya cuma konteks ("kirim vn ngaji untuk grup ini"
+    # → "ngaji untuk grup ini" itu BUKAN teks VN — mending agent yang bikin).
+    # FIX 2 (19 Agu): "in"/"isi" = kata sambung, jangan ikut ke-TTS
+    # ("vn in aku goodnight sayang" → "aku goodnight sayang", bukan
+    # "in aku goodnight sayang").
+    m = re.search(
+        r"\b(?:vn|voice(?:\s*note)?)\b\s+(?:bilang|ucapin|yang|isi|nya|in)\s*[:\\-]?\s*([A-Za-z0-9 _'’.,!?]{2,200})$",
+        text, re.I)
+    if m:
+        return m.group(1).strip()
+    # "vn <teks>" langsung (tanpa kata hubung) — cuma match kalau teksnya
+    # pendek (<=4 kata) & gak ada kata konteks kayak "untuk"/"di"/"ke"/"buat"
+    m = re.search(
+        r"\b(?:vn|voice(?:\s*note)?)\b\s+((?:(?!untuk|buat|di |ke |grup|channel|chat|kirim|tolong|minta|bikin|in )[A-Za-z0-9 _'’.,!?]){2,60})$",
+        text, re.I)
+    if m:
+        _cand = m.group(1).strip()
+        if len(_cand.split()) <= 4 and not re.search(r"\b(untuk|buat|grup|channel|kirim|tolong|minta|bikin)\b", _cand, re.I):
+            return _cand
     return None
 
 async def _send_vn(event, chat_id: int, text: str) -> bool:
@@ -806,9 +869,10 @@ def _history_path(chat_id: int) -> str:
     except Exception:
         return ""
 
-def _append_history(chat_id: int, name: str, text: str, ts: str = "") -> None:
+def _append_history(chat_id: int, name: str, text: str, ts: str = "", user_id: int = 0, username: str = "") -> None:
     """Append pesan grup ke history.md (rolling FIFO — header 👑/🛡️ di-pisah
-    biar nggak ke-roll — agent baca file tetep liat owner/admin/title!)."""
+    biar nggak ke-roll — agent baca file tetep liat owner/admin/title!).
+    Format baris include id/@username biar agent bisa resolve user buat DM."""
     try:
         p = _history_path(chat_id)
         if not p:
@@ -817,7 +881,15 @@ def _append_history(chat_id: int, name: str, text: str, ts: str = "") -> None:
         import datetime as _dt
         if not ts:
             ts = _fmt_ts(_dt.datetime.now())
-        line = f"[{ts}] {name}: {(text or '').strip()[:200]}"
+        # ── sertakan id + @username di baris history (agent bisa resolve user)
+        _h_suffix = ""
+        try:
+            _hid = int(user_id or 0)
+            if _hid:
+                _h_suffix = f" (id:{_hid}{', @'+username if username else ''})"
+        except Exception:
+            pass
+        line = f"[{ts}] {name}{_h_suffix}: {(text or '').strip()[:200]}"
         try:
             with open(p, encoding="utf-8") as f:
                 lines = f.read().splitlines()
@@ -865,6 +937,7 @@ def _save_state(enabled_val: bool, disabled: set, self_trigger_val: bool = None)
                 "enabled": enabled_val,
                 "disabled_users": sorted(disabled),
                 "self_trigger": bool(self_trigger_val) if self_trigger_val is not None else self_trigger,
+                "tools_inactive": sorted(tools_inactive),
             }, f)
     except Exception:
         pass
@@ -877,6 +950,33 @@ def _save_self_trigger(v: bool) -> None:
 enabled = _load_enabled()
 disabled_users = _load_disabled_users()
 self_trigger = _load_self_trigger()
+
+# ── .ub tools inactive: chat_id yang tool bubbles-nya di-disable (per chat).
+# Kalau inactive, progress tool (💻, 📚, dll) GAK dikirim ke chat — cuma
+# reply final. Persist di STATE_FILE (key "tools_inactive").
+def _load_tools_inactive() -> set:
+    try:
+        import json as _json
+        with open(config.STATE_FILE) as f:
+            st = _json.load(f)
+        return set(int(x) for x in st.get("tools_inactive", []) or [])
+    except Exception:
+        return set()
+
+tools_inactive = _load_tools_inactive()
+
+_UB_HELP = (
+    "command .ub:\n"
+    "- .ub tools inactive → matiin bubble progress tool di chat ini (💻📚 dll gak muncul, cuma reply final)\n"
+    "- .ub tools active → nyalain lagi bubble progress tool\n"
+    "- .ub models → liat daftar model + model yang lagi dipake di chat ini\n"
+    "- .ub models <nomor> → ganti model chat ini (contoh: .ub models 1 = deepseek v4 pro)\n"
+    "- .ub reset → reset session semua chat\n"
+    "- .ub status → cek status\n"
+    "- .ub on/off → aktifin/nonaktifin userbot\n"
+    "- .ub help → nampilin command ini\n\n"
+    "catatan: setting per chat, gak ngaruh ke chat lain."
+)
 
 # ── MERGE WINDOW BUFFER: Telegram auto-split pesan panjang jadi beberapa
 # bubble (<1 detik antar bubble). Buffer per (chat_id, user_id): bubble
@@ -961,6 +1061,86 @@ async def on_incoming(event):
     if _sender_id(event) in disabled_users:
         return
 
+    # ── .ub COMMANDS: .ub tools active/inactive, .ub help
+    # FIX (21 Agu): guard owner — sebelumnya siapa pun bisa (komentar lama
+    # bilang "bisa dipake siapa aja" — itu bug). cuma akun userbot sendiri.
+    if text_raw.startswith(".ub"):
+        try:
+            if event.out:
+                return  # pesan dari akun sendiri diproses handler outgoing
+            _ub_owner = await client.get_me()
+            if getattr(_ub_owner, "id", 0) != _sender_id(event):
+                return  # bukan owner → abaikan
+            args = text_raw[3:].strip().lower()
+            if args == "tools inactive":
+                tools_inactive.add(event.chat_id)
+                _save_state(enabled, disabled_users)
+                await event.reply("🔕 bubble progress tool di chat ini dimatiin. cuma reply final yang muncul. (`.ub tools active` buat balikin)")
+                return
+            if args == "tools active":
+                tools_inactive.discard(event.chat_id)
+                _save_state(enabled, disabled_users)
+                await event.reply("🔔 bubble progress tool aktif lagi di chat ini.")
+                return
+            # default / help
+            await event.reply(_UB_HELP)
+        except Exception as _ube:
+            log.warning(".ub command error: %s", _ube)
+            try:
+                await event.reply(_UB_HELP)
+            except Exception:
+                pass
+        return
+
+    # ── DM RELAY (20:30): user yang lagi punya pending DM request (agent
+    # minta private key/info via DM) → pesan private ini = JAWABAN, inject
+    # ke session grup asal. Bisa dibales bisa ngga — kalau ngga dibales,
+    # pending tetep nyimpen sampe kedaluwarsa/overwrite.
+    # /skip / stop → batalkan request, kabarin ke grup.
+    if event.is_private:
+        _uid = _sender_id(event)
+        if hermes_bridge.has_pending_dm(_uid):
+            _dm_txt = (event.raw_text or "").strip().lower()
+            if _dm_txt in ("/skip", "skip", "gak jadi", "ngga jadi", "/stop", "stop"):
+                try:
+                    _pend = hermes_bridge.pop_pending_dm(_uid)
+                    log.info("DM relay: user=%s SKIP request", _uid)
+                    await event.reply("oke, gw skip. request dibatalin.")
+                    # kabarin agent grup biar gak nungguin — pakai notify_group
+                    # (pending udah di-pop, inject_dm_reply gak bisa)
+                    if _pend:
+                        try:
+                            await hermes_bridge.notify_group(
+                                _pend["chat_id"],
+                                f"[user {_uid} skip — request DM dibatalkan, lanjut tanpa dia]",
+                            )
+                        except Exception:
+                            pass
+                except Exception as _e:
+                    log.warning("DM relay skip gagal: %s", _e)
+                return
+            try:
+                ok = await hermes_bridge.inject_dm_reply(_uid, event.raw_text or "")
+                if ok:
+                    log.info("DM relay: jawaban user=%s di-inject ke grup", _uid)
+                    try:
+                        await event.reply("oke, udah gw terusin ke grup. tunggu respon agent di grup ya.")
+                    except Exception:
+                        pass
+                    return
+            except Exception as _e:
+                log.warning("DM relay inject gagal: %s", _e)
+
+    # ── MODERATION ENGINE (19 Agu): cek rule dulu SEBELUM agent — kalau
+    # match rule → eksekusi mute/delete/kick langsung via client (GRATIS,
+    # tanpa LLM/credit). Return True = pesan di-tindak, agent gak kepanggil.
+    try:
+        import moderation
+        if await moderation.check_and_execute(client, event):
+            return
+    except Exception as _mode:
+        log.warning("moderation check error: %s", _mode)
+
     return await _run_agent(event)
 
 async def _run_agent(event, _merged_text=None):
@@ -980,7 +1160,7 @@ async def _run_agent(event, _merged_text=None):
     if config.REQUIRE_PREFIX:
         _stripped = _text_raw.strip()
         if _stripped.lower().startswith(config.REQUIRE_PREFIX.lower()):
-            _typing_task = asyncio.create_task(_keep_typing(event.chat_id))
+            _typing_task = _typing_start(event.chat_id)
     _record_seen_chat(event.chat_id)  # catat chat aktif → pre-warm restart
     try:
         sender = await event.get_sender()
@@ -1008,6 +1188,44 @@ async def _run_agent(event, _merged_text=None):
         return
 
     text = event.raw_text or ""
+
+    # ── FIX (19 Agu): inject KONTEKS REPLY — kalau user reply ke sebuah
+    # pesan, isi pesan yang di-reply di-append ke teks prompt agent. Ini
+    # bikin agent tau "kek gini" itu kayak apa (misal instruksi moderasi:
+    # "kalo ada chat kek gini mute" + reply ke pesan contoh → agent liat
+    # contohnya). Dulu cuma dipake buat nentuin "called" — isinya gak
+    # pernah ke-include → agent nebak-nebak pattern.
+    try:
+        if getattr(event, "is_reply", False):
+            _rep = await event.get_reply_message()
+            if _rep is not None:
+                _rep_txt = (_rep.message or "").strip()
+                _rep_sender = ""
+                try:
+                    _rs = await _rep.get_sender()
+                    _rep_sender = f"dari {getattr(_rs, 'first_name', '?') or '?'} (id:{getattr(_rs, 'id', 0)})"
+                except Exception:
+                    pass
+                _rep_media = ""
+                if getattr(_rep, "media", None) is not None:
+                    try:
+                        from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
+                        if isinstance(_rep.media, MessageMediaPhoto):
+                            _rep_media = " [pesan berisi GAMBAR/foto]"
+                        elif isinstance(_rep.media, MessageMediaDocument):
+                            _rep_media = " [pesan berisi FILE/dokumen]"
+                        else:
+                            _rep_media = " [pesan berisi MEDIA]"
+                    except Exception:
+                        _rep_media = " [pesan berisi media]"
+                if _rep_txt or _rep_media:
+                    text = (
+                        f"{text}\n\n"
+                        f"[REPLY KE: pesan {_rep_sender}{_rep_media}"
+                        f"{': ' + _rep_txt if _rep_txt else ''}]"
+                    )
+    except Exception as _re:
+        log.warning("inject reply context gagal: %s", _re)
 
     # ── STOP: "/stop" / "sonnet stop" / "stop" → cancel run yang lagi jalan
     # (konsep kayak Hermes: stop = interrupt run, session tetep hidup)
@@ -1063,7 +1281,11 @@ async def _run_agent(event, _merged_text=None):
     try:
         if event.chat_id < 0:
             _hname = getattr(sender, "first_name", "") or getattr(sender, "title", "") or "?"
-            _append_history(event.chat_id, _hname, event.raw_text or "")
+            _append_history(
+                event.chat_id, _hname, event.raw_text or "",
+                user_id=getattr(sender, "id", 0) or 0,
+                username=getattr(sender, "username", "") or "",
+            )
     except Exception:
         pass
 
@@ -1097,7 +1319,7 @@ async def _run_agent(event, _merged_text=None):
         _do_sticker_typing = True
     else:
         # ── Aturan lama: "Apakah dipanggil?"
-        typing_task = _typing_task or asyncio.create_task(_keep_typing(event.chat_id))
+        typing_task = _typing_task or _typing_start(event.chat_id)
         try:
             if event.is_private:
                 called = True
@@ -1113,10 +1335,10 @@ async def _run_agent(event, _merged_text=None):
                 if me.username and f"@{me.username}".lower() in raw:
                     called = True
         except Exception:
-            typing_task.cancel()
+            _typing_stop(event.chat_id)
             return  # entity gagal — skip
         if not called:
-            typing_task.cancel()
+            _typing_stop(event.chat_id)
             return
 
     if _do_sticker_typing:
@@ -1144,7 +1366,7 @@ async def _run_agent(event, _merged_text=None):
         # FIX: kalau _typing_task sudah cancelled/done, bikin task baru
         # (tanpa ini, typing nggak restart setelah cancel → kedip/ilang)
         if _typing_task is None or _typing_task.done():
-            typing_task = asyncio.create_task(_keep_typing(event.chat_id))
+            typing_task = _typing_start(event.chat_id)
         else:
             typing_task = _typing_task
 
@@ -1236,7 +1458,7 @@ async def _run_agent(event, _merged_text=None):
                     proj_dir = os.path.join(folder, "projects", os.path.basename(dl)[:-4])
                     os.makedirs(proj_dir, exist_ok=True)
                     _extract_zip_safe(dl, proj_dir)
-                text = f"{text}\n\n[File dari user: {dl}]".strip()
+                text = f"{text}\n\n[Attachment 1: {dl}\nPath: {dl}\nINSTRUKSI WAJIB (sama kayak Hermes native): file ini adalah ATTACHMENT dari user — WAJIB dibaca pake read_file SEBELUM ngerjain apa pun. JANGAN skip baca cuma karena lo udah tau brand/konteksnya. Kalau user minta 'mirip contoh'/'kayak ini'/'ikutin ini' — struktur output WAJIB ngikutin file ini PERSIS (class, layout, angle teks, elemen, CTA, footer), jangan bikin dari imajinasi sendiri. Verify = BANDINGKAN output ke file ini, bukan ngecek elemen buatan sendiri.]".strip()
                 log.info("dokumen user ke-download: %s", dl)
             else:
                 log.warning("download dokumen gagal (dl kosong)")
@@ -1258,7 +1480,13 @@ async def _run_agent(event, _merged_text=None):
     # is_exfil: di GRUP tetap diblokir (private key/kredensial nggak boleh
     # keluar di grup); di PRIVATE chat dilewatkan ke agent (agent yang nilai —
     # SOUL bilang kirim boleh di private).
-    if is_dangerous(text) or (is_exfil(text) and not getattr(event, "is_private", False)):
+    # ── FIX (11:20): grup STAFF (5377245777) di-exempt dari exfil filter —
+    # operator minta prompt pentest/backend dalem (actuator, heapdump, DB),
+    # ke-block gara-gara kata "password/credential/key" di prompt. Staff =
+    # trusted operator, agent yang nilai.
+    _STAFF_CHAT_IDS = {-5377245777, -1002732627985}
+    if is_dangerous(text) or (is_exfil(text) and not getattr(event, "is_private", False)
+                              and chat_id not in _STAFF_CHAT_IDS):
         log.warning("blocked request in chat=%s: %.80s", chat_id, text)
         h = get_history(chat_id)
         h.append(("user", text))
@@ -1267,24 +1495,58 @@ async def _run_agent(event, _merged_text=None):
             await event.reply(config.DANGER_PHRASE, link_preview=False)
         except Exception as e:
             log.exception("failed to send danger refusal")
-        typing_task.cancel()
+        _typing_stop(event.chat_id)
         return
 
     cooldown = config.HERMES_COOLDOWN if config.UB_MODE == "hermes" else config.COOLDOWN
     sender_id = getattr(sender, "id", 0) or 0
     if on_cooldown(chat_id, sender_id, cooldown):
         log.info("cooldown, skip chat=%s user=%s", chat_id, sender_id)
-        typing_task.cancel()
+        _typing_stop(event.chat_id)
         return
     set_cooldown(chat_id, sender_id)
 
     # Info pengirim + judul chat buat konteks agent
     sender_name = getattr(sender, "first_name", None) or getattr(sender, "username", None) or str(sender.id)
+    # ── FIX (20:50): sertakan user_id di nama sender biar agent tau ID orang
+    # yang chat → bisa pake DM_TO:<user_id> / DM_TO:@username dengan benar.
+    try:
+        _sid = int(getattr(sender, "id", 0) or 0)
+        if _sid:
+            _uname = getattr(sender, "username", None)
+            sender_name = f"{sender_name} (id:{_sid}{', @'+_uname if _uname else ''})"
+    except Exception:
+        pass
     try:
         chat_entity = await event.get_chat()
         chat_title = getattr(chat_entity, "title", None) or getattr(chat_entity, "first_name", None)
     except Exception:
         chat_title = None
+
+    # ── FIX (23 Agu): deteksi pesan FORWARD — agent tau pesan di-forward
+    # (bukan pesan asli sender) → bisa bedain konten kiriman vs asli.
+    fwd_tag = ""
+    try:
+        fwd = getattr(event, "forward", None)
+        if fwd:
+            _fwd_from = "?"
+            try:
+                if getattr(fwd, "from_id", None):
+                    _fe = await client.get_entity(fwd.from_id)
+                    _fwd_from = getattr(_fe, "username", None) or getattr(_fe, "first_name", None) or getattr(_fe, "title", None) or str(fwd.from_id)
+                elif getattr(fwd, "from_name", None):
+                    _fwd_from = fwd.from_name
+            except Exception:
+                _fwd_from = getattr(fwd, "from_name", None) or "?"
+            _fwd_date = ""
+            try:
+                if getattr(fwd, "date", None):
+                    _fwd_date = f" ({fwd.date.strftime('%d %b %H:%M')})"
+            except Exception:
+                pass
+            fwd_tag = f"\n[PESAN FORWARD dari: {_fwd_from}{_fwd_date} — ini pesan kiriman, bukan teks asli sender]"
+    except Exception:
+        pass
 
     log.info("replying in chat=%s from %s: %.80s", chat_id, sender.id, text)
     try:
@@ -1292,6 +1554,10 @@ async def _run_agent(event, _merged_text=None):
             # ── Streaming Hermes-style: teks ngetik sendiri + bubble terpisah per tool
             msg = None
             last_emitted = ""
+            # ── FIX (19 Agu): flag reply multi-segment — kalau agent nulis
+            # ulang (new_segment), final edit gak boleh nge-overwrite bubble
+            # yang udah ke-stream (laporan gede ilang ke-ganti reply pendek).
+            _multi_segment = False
 
             # ── Voice note? kalau user minta VN, reply jadi 1 VN di akhir
             # (single-VN — multi-segmen dipindah ke Hermes asli).
@@ -1300,9 +1566,12 @@ async def _run_agent(event, _merged_text=None):
             if is_vn:
                 text_for_agent = (
                     text
-                    + "\n\n[Catatan: user minta VOICE NOTE — balas HANYA teks singkat "
-                    "natural yang bakal dibacain suara TTS. Nggak usah format HTML "
-                    "atau markdown, langsung teks polos.]"
+                    + "\n\n[Catatan: user minta VOICE NOTE (TTS) — ATURAN WAJIB:\n"
+                    "1. KALAU user nyebut teks spesifik yang mau dibacain (contoh: \"vn i love you\", \"vn in aku goodnight sayang\", \"vn bilang selamat pagi\") — balas HANYA teks itu PERSIS, tanpa nambahin kalimat sendiri, tanpa komentar, tanpa format apa pun. Teks lo bakal dibacain suara TTS.\n"
+                    "2. KALAU user gak nyebut teks spesifik (contoh: \"kirim vn ngaji\", \"vn dong\") — bikin teks singkat natural sesuai konteks (2-3 kalimat maksimal), yang enak dibacain.\n"
+                    "3. JANGAN PERNAH nulis: \"vn nya udah gw bikin\", \"file ada di\", \"MEDIA:\", \"udah gw kirim\" — teks lo bakal dibacain KATA DEMI KATA. Reply = ISI VN-nya, bukan laporan.\n"
+                    "4. Nggak usah format HTML/markdown — langsung teks polos.\n"
+                    "5. Bahasa tetep NGIKUT USER: user chat Indonesia → teks VN Indonesia santai (kayak biasa); user chat English → English. Gak berubah dari gaya sebelumnya — yang ditambah cuma aturan ISI (jangan laporan, jangan nambahin kalimat).]"
                 )
                 # kalau user kasih teks eksplisit yang mau dibacain (di quote),
                 # TTS langsung — JANGAN biarin agent bikin komentar sendiri
@@ -1310,10 +1579,24 @@ async def _run_agent(event, _merged_text=None):
                 if quoted:
                     log.info("vn override: TTS teks user langsung (chat=%s)", chat_id)
                     await _send_vn(event, chat_id, quoted)
-                    typing_task.cancel()
+                    _typing_stop(event.chat_id)
                     return
             else:
-                text_for_agent = text
+                text_for_agent = text + fwd_tag
+
+            # ── FIX (19 Agu): user minta "bisa inbox ke hotmail/outlook" →
+            # agent WAJIB bahas deliverability, bukan cuma kirim HTML doang.
+            # (pelajaran: Yopi minta "letter yg bisa inbox ke hotmail" —
+            # agent gak pernah ngangkat aspek ini.)
+            _tl = text.lower()
+            if any(k in _tl for k in ("hotmail", "outlook", "masuk inbox", "bisa inbox", "inbox ke")):
+                text_for_agent = (
+                    text_for_agent
+                    + "\n\n[Catatan WAJIB — user minta email yang bisa masuk INBOX hotmail/outlook:\n"
+                    "1. HTML doang GAK cukup buat inbox hotmail — explain ke user faktor deliverability: SPF, DKIM, DMARC (wajib di domain pengirim), reputasi domain & IP, header email (List-Unsubscribe, Precedence: bulk), multipart text/plain + text/html, SMTP relay (SendGrid/Mailgun/SES) daripada kirim langsung dari VPS.\n"
+                    "2. Jawaban lo WAJIB nyebut deliverability ini (ringkas, 3-5 poin), bukan cuma 'file jadi, tinggal kirim'.\n"
+                    "3. Struktur HTML tetap wajib: table-based 640px, style inline, preheader, logo resmi, CTA tunggal, gak ada JS/form, gak ada kata spam.]"
+                )
 
             # Tool bubble messages — dihapus pas run selesai (kayak Hermes
             # cleanup_progress: progress keliatan LIVE, tapi chat nggak penuh
@@ -1341,6 +1624,9 @@ async def _run_agent(event, _merged_text=None):
                 # (hapus tetap terjadi pas reply mulai — on_update!)
                 if not config.SHOW_TOOL_BUBBLES:
                     return
+                # ── .ub tools inactive: chat ini gak mau liat bubble tool
+                if chat_id in tools_inactive:
+                    return
                 if tool_name in config.HIDE_TOOL_BUBBLES:
                     return  # tool internal (session_search, memory, todo) — nggak dimunculin
                 emoji = emoji.replace("\ufe0f", "")  # buang variation selector
@@ -1366,7 +1652,7 @@ async def _run_agent(event, _merged_text=None):
                 log.info("tool chat=%s tool=%s elapsed=%.3fs", chat_id, _tool_name_log, time.monotonic() - _tool_t0)
 
             async def on_update(partial: str, new_segment: bool = False):
-                nonlocal msg, last_emitted, hb_msg, thinking_msg
+                nonlocal msg, last_emitted, hb_msg, thinking_msg, _multi_segment
                 if not partial:
                     return
                 # ── reply bubble MULAI → hapus indikator "💭 THINKING..." +
@@ -1402,6 +1688,14 @@ async def _run_agent(event, _merged_text=None):
                 )
                 try:
                     if msg is None or new_segment:
+                        if new_segment:
+                            # ── FIX (19 Agu): reply multi-segment (agent nulis
+                            # ulang / lanjut di bubble baru) — tandai biar final
+                            # edit GAK nge-overwrite bubble terakhir. Dulu: msg
+                            # = bubble terakhir → final edit nge-edit bubble itu
+                            # pake reply_text → reply yang udah ke-stream di
+                            # bubble SEBELUMNYA keliatan ilang/ke-ganti.
+                            _multi_segment = True
                         msg = await asyncio.wait_for(
                             event.reply(
                                 hermes_bridge._sanitize_html(display),
@@ -1490,7 +1784,7 @@ async def _run_agent(event, _merged_text=None):
                     "truncated": "⚠️ Response truncated — agent lagi lanjutin reply-nya...",
                     "fallback": "🔄 Provider fail — switch ke fallback provider...",
                     "content_filter": "🛡️ Content filter — agent switch fallback...",
-                    "self_improve": "💾 Self-improvement review — agent rapiin skill/memory...",
+                    "self_improve": None,  # FIX (19 Agu): self-improvement review = info INTERNAL — jangan kirim ke chat user (spam tiap reply)
                     "thinking": "💭 THINKING...",
                     "prewarm": "🧠 PRE WARM...",
                 }
@@ -1499,9 +1793,12 @@ async def _run_agent(event, _merged_text=None):
                     nonlocal thinking_msg
                     try:
                         _txt = _STATE_TEXTS.get(state_key)
-                        # self-improve: kirim LINE ASLI dari CLI (bukan paraphrase)
-                        if detail and state_key == "self_improve":
-                            _txt = detail
+                        # self-improve: FIX (19 Agu) — MATIIN relay ke chat
+                        # (state text = None). Review skill/memory itu kerjaan
+                        # internal agent, gak perlu spam ke user tiap reply.
+                        if state_key == "self_improve":
+                            log.info("self-improve (internal, gak ke-kirim): %s", detail or "")
+                            return
                         if _txt:
                             # ── FIX: hanya skip PRE WARM — yang lain boleh
                             # muncul ke user.
@@ -1571,11 +1868,23 @@ async def _run_agent(event, _merged_text=None):
                                 _admin_cache[_chat_id] = (_now, "")
                                 return ""
                             from telethon.tl.types import ChannelParticipantsAdmins
-                            admins = await client.get_participants(
-                                _chat_id, filter=ChannelParticipantsAdmins())
+                            # ── FIX (19 Agu): fallback kalau filter admins error —
+                            # retry pake get_participants biasa + filter manual
+                            try:
+                                admins = await client.get_participants(
+                                    _chat_id, filter=ChannelParticipantsAdmins())
+                            except Exception:
+                                _all = await client.get_participants(_chat_id)
+                                admins = [u for u in _all if getattr(u, "participant", None)
+                                          and type(u.participant).__name__ in ("ChannelParticipantAdmin", "ChannelParticipantCreator")]
                             owner_name, admin_list = "", []
                             for a in admins:
                                 aname = getattr(a, "first_name", "") or str(getattr(a, "id", ""))[:8]
+                                aid = getattr(a, "id", 0)
+                                auname = getattr(a, "username", None)
+                                # sertakan id + @username biar agent bisa DM_TO:<id>/@user
+                                aid_s = f" (id:{aid}{', @'+auname if auname else ''})" if aid else ""
+                                aname_full = f"{aname}{aid_s}"
                                 rank = ""
                                 try:
                                     rank = getattr(a.participant, "rank", "") or ""
@@ -1587,9 +1896,9 @@ async def _run_agent(event, _merged_text=None):
                                 except Exception:
                                     is_creator = False
                                 if is_creator:
-                                    owner_name = aname
+                                    owner_name = aname_full
                                 else:
-                                    admin_list.append(f"{aname}{(' [' + rank + ']') if rank else ''}")
+                                    admin_list.append(f"{aname_full}{(' [' + rank + ']') if rank else ''}")
                             parts = []
                             if owner_name:
                                 parts.append(f"👑 Owner grup: {owner_name}")
@@ -1598,7 +1907,8 @@ async def _run_agent(event, _merged_text=None):
                             res = "\n".join(parts)
                             _admin_cache[_chat_id] = (_now, res)
                             return res
-                        except Exception:
+                        except Exception as e:
+                            log.warning("admin header fetch gagal chat=%s: %s", _chat_id, e)
                             return ""
 
                     _obs_cursor: dict = {}  # chat_id → jumlah baris history.md yang udah di-inject
@@ -1654,7 +1964,6 @@ async def _run_agent(event, _merged_text=None):
                                 return ""
                             msgs = _msgs
                             senders = {}
-                            lines = []
                             _me_id = getattr(await client.get_me(), "id", 0)
                             for m in reversed(msgs):  # kronologis
                                 if not m or m.message is None:
@@ -1665,12 +1974,21 @@ async def _run_agent(event, _merged_text=None):
                                 who = getattr(m.sender_id, "id", None) or getattr(m.sender_id, "", m.sender_id) if not isinstance(m.sender_id, int) else m.sender_id
                                 # resolve sender name
                                 name = "?"
+                                _s_uname = None
                                 try:
                                     ent = await client.get_entity(who) if who else None
                                     name = getattr(ent, "first_name", "") or getattr(ent, "title", "") or str(who)[:8]
+                                    _s_uname = getattr(ent, "username", None)
                                 except Exception:
                                     name = str(who)[:8]
-                                senders[m.id] = name
+                                # ── sertakan id + @username biar agent bisa resolve user
+                                _s_suffix = ""
+                                try:
+                                    if who:
+                                        _s_suffix = f" (id:{int(who)}{', @'+_s_uname if _s_uname else ''})"
+                                except Exception:
+                                    pass
+                                senders[m.id] = f"{name}{_s_suffix}"
                             for m in reversed(msgs):
                                 if not m or m.message is None:
                                     continue
@@ -1754,7 +2072,7 @@ async def _run_agent(event, _merged_text=None):
                     except Exception:
                         pass
                     _pending_clarify.pop(chat_id, None)
-                    typing_task.cancel()
+                    _typing_stop(event.chat_id)
                     return
                 # run kelar (atau timeout) → pending clarify dibersihin biar
                 # pesan berikutnya nggak ke-makan sebagai jawaban clarify.
@@ -1766,10 +2084,10 @@ async def _run_agent(event, _merged_text=None):
                     hermes_bridge.clear_busy(chat_id, getattr(sender, "id", 0))
                     if status_msg is not None:
                         asyncio.create_task(_delete_later(10))
-                    typing_task.cancel()
+                    _typing_stop(event.chat_id)
                     return
 
-            typing_task.cancel()
+            _typing_stop(event.chat_id)
 
             # heartbeat "⏳ Working" dihapus pas run kelar — reply bubble gantiin
             if hb_msg is not None:
@@ -1784,6 +2102,42 @@ async def _run_agent(event, _merged_text=None):
                 if await _send_vn(event, chat_id, reply_text):
                     hermes_bridge.clear_busy(chat_id, getattr(sender, "id", 0))
                     return
+
+            # ── DM RELAY (20:30): agent minta private key/info via DM.
+            # Agent nulis "DM_TO:<user_id>: <pertanyaan>" di reply → strip
+            # marker, kirim DM ke user tsb, catat pending (balasannya nanti
+            # di-inject ke session grup asal — bukan session DM).
+            try:
+                reply_text, dm_reqs = hermes_bridge.parse_dm_marker(reply_text, caller_user_id=getattr(sender, "id", 0))
+                for _tgt, _q in dm_reqs:
+                    try:
+                        _tgt_s = str(_tgt)
+                        if _tgt_s.startswith("@"):
+                            # resolve @username → user_id (agent tau username, bukan id)
+                            try:
+                                _ent = await client.get_entity(_tgt_s)
+                                _uid = getattr(_ent, "id", 0)
+                            except Exception as _e2:
+                                log.warning("resolve username %s gagal: %s", _tgt_s, _e2)
+                                _uid = 0
+                        else:
+                            _uid = int(_tgt_s)
+                        if not _uid or _uid == getattr(me, "id", 0):
+                            # jangan DM ke diri sendiri (Saved Messages) — skip
+                            log.warning("DM target %s invalid/self — skip", _tgt)
+                            continue
+                        await client.send_message(
+                            _uid,
+                            f"dari bot di grup:\n{_q}\n\n"
+                            "balas langsung di sini ya (gak perlu pake 'sonnet', cukup ketik jawabannya), nanti gw terusin ke grup.\n"
+                            "kalau gak mau lanjut, kirim /skip",
+                        )
+                        hermes_bridge.set_pending_dm(_uid, chat_id, _q)
+                        log.info("DM request dikirim ke user=%s (chat asal %s)", _uid, chat_id)
+                    except Exception as _dme:
+                        log.warning("kirim DM request ke user=%s gagal: %s", _tgt, _dme)
+            except Exception as _dmp:
+                log.warning("parse DM marker gagal: %s", _dmp)
 
             # file yang agent sebut (MEDIA:/path) — pisahin dari teks, kirim belakangan
             reply_text, media_paths = _extract_media(reply_text)
@@ -1819,7 +2173,12 @@ async def _run_agent(event, _merged_text=None):
 
             # edit final biar persis sama hasil agent (kayak Hermes: edit
             # streaming preview in-place — bukan delete + kirim ulang).
-            if msg is not None and hermes_bridge.was_steered(chat_id, getattr(sender, "id", 0)):
+            # ── FIX (19 Agu): kalau reply multi-segment (agent nulis ulang di
+            # bubble baru), SKIP final edit — bubble udah ke-stream bener,
+            # edit malah nge-overwrite reply terakhir doang.
+            if _multi_segment:
+                log.info("multi-segment reply — skip final edit (bubble stream udah bener)")
+            elif msg is not None and hermes_bridge.was_steered(chat_id, getattr(sender, "id", 0)):
                 # ── FIX BUG: run ke-steer (user lain inject mid-run) — final
                 # reply jangan nge-EDIT bubble stream user sebelumnya (bikin
                 # reply user A keganti reply user B). Kirim sebagai pesan BARU.
@@ -1883,6 +2242,17 @@ async def _run_agent(event, _merged_text=None):
                 except Exception as e:
                     log.warning("cleanup tool bubble gagal chat=%s: %s", chat_id, e)
             log.info("phase chat=%s phase=reply_sent elapsed=%.3fs", _chat_id, time.monotonic() - _run_t0)
+            # ── FIX (21 Agu): auto-compress konteks abis reply — kalau usage
+            # pane > 65%, inject /compress biar konteks gak numpuk (anti
+            # "agent ngulang jawaban lama"). Fire & forget, jangan block reply.
+            try:
+                _is_g = str(chat_id).startswith('-100')
+                _ctx = hermes_bridge._resolve_context(chat_id, 0 if _is_g else getattr(sender, "id", 0))
+                _sess = hermes_bridge._session_name(chat_id, _ctx)
+                if _sess:
+                    asyncio.create_task(hermes_bridge._auto_compress(_sess))
+            except Exception:
+                pass
         else:
             async with client.action(event.chat_id, "typing"):
                 reply_text = await generate_reply(chat_id, text)
@@ -1894,7 +2264,7 @@ async def _run_agent(event, _merged_text=None):
         log.warning("AgentError: %s", e)
         hermes_bridge.clear_busy(chat_id, getattr(sender, "id", 0))
         try:
-            typing_task.cancel()
+            _typing_stop(event.chat_id)
         except Exception:
             pass
         try:
@@ -1914,7 +2284,7 @@ async def _run_agent(event, _merged_text=None):
         log.exception("%s error, lapor ke user", config.UB_MODE.upper())
         hermes_bridge.clear_busy(chat_id, getattr(sender, "id", 0))
         try:
-            typing_task.cancel()
+            _typing_stop(event.chat_id)
         except Exception:
             pass
         # ── FIX (audit): jangan DIAM — kasih tau user + solusi (kirim ulang /
@@ -1937,6 +2307,7 @@ async def _run_agent(event, _merged_text=None):
 async def on_self_command(event):
     global enabled, self_trigger
     text = event.raw_text or ""
+    log.info("DEBUG outgoing: chat=%s text=%r", event.chat_id, text[:60])
     stripped = text.strip().lower()
     # /switch_on / /switch_off — SELF-TRIGGER (akun sendiri bisa manggil agent
     # pake "SONNET ..." — outgoing). Diketik dari akun userbot.
@@ -1955,6 +2326,19 @@ async def on_self_command(event):
         return
     if not text.startswith(config.CMD_PREFIX):
         return
+    # ── FIX (21 Agu): guard .ub command — cuma akun userbot (owner) yang
+    # boleh. sebelum ini siapa pun di grup bisa ketik ".ub off" (userbot mati)
+    # atau ".ub reset" (semua session ke-reset) — bahaya.
+    # FIX (21 Agu #2): pakai event.sender_id — variabel `sender` gak ada di
+    # scope handler outgoing → NameError → silent return (semua .ub gak jalan).
+    try:
+        _ub_me = await client.get_me()
+        _ub_sender = event.sender_id or 0
+        if _ub_sender != getattr(_ub_me, "id", 0):
+            return  # bukan owner → abaikan
+    except Exception as _e:
+        log.warning(".ub guard error: %s", _e)
+        return
     cmd = text[len(config.CMD_PREFIX):].strip().lower()
     if cmd == "on":
         enabled = True
@@ -1968,12 +2352,87 @@ async def on_self_command(event):
         await event.edit(
             f"Userbot {'🟢 ON' if enabled else '🔴 OFF'} · "
             f"mode {config.UB_MODE} · cooldown {config.HERMES_COOLDOWN if config.UB_MODE == 'hermes' else config.COOLDOWN}s · "
-            f"model {config.MODEL}"
+            f"model {config.chat_model(event.chat_id)}"
         )
+    elif cmd.startswith("models"):
+        # ── FIX (23 Agu): per-chat model — .ub models (list) / .ub models <N> (ganti)
+        try:
+            parts = cmd.split()
+            if len(parts) == 1:
+                cur = config.chat_model(event.chat_id)
+                lines = ["model yang tersedia:"]
+                for i, (mid, mname) in enumerate(config.MODEL_LIST, 1):
+                    mark = "▶" if mid == cur else " "
+                    lines.append(f"{mark} {i}. {mname}")
+                if cur not in [m[0] for m in config.MODEL_LIST]:
+                    lines.append(f"   (saat ini: {cur} — bukan dari list)")
+                lines.append("pake `.ub models <nomor>` buat ganti model chat ini")
+                await event.edit("\n".join(lines))
+            elif len(parts) == 3 and parts[1] == "all" and parts[2].isdigit():
+                n = int(parts[2])
+                if 1 <= n <= len(config.MODEL_LIST):
+                    mid, mname = config.MODEL_LIST[n - 1]
+                    ids = config.save_chat_models_all(mid)
+                    try:
+                        patched = config.set_config_model_all(mid)
+                    except Exception as _ce:
+                        log.warning(".ub models all set_config error: %s", _ce)
+                        patched = []
+                    killed = await hermes_bridge.reset_sessions()
+                    await event.edit(
+                        f"✅ model SEMUA ({len(ids)} chat) → **{mname}**\n"
+                        f"config patched: {len(patched)} · session di-reset: {killed}\n"
+                        f"agent spawn ulang otomatis pas chat berikutnya"
+                    )
+                else:
+                    await event.edit(f"nomor model gak valid (1-{len(config.MODEL_LIST)})")
+            elif len(parts) == 2 and parts[1].isdigit():
+                n = int(parts[1])
+                if 1 <= n <= len(config.MODEL_LIST):
+                    mid, mname = config.MODEL_LIST[n - 1]
+                    data = config.load_chat_models()
+                    data[str(event.chat_id)] = mid
+                    config.save_chat_models(data)
+                    # patch config.yaml juga — env doang gak nge-override config (kasus ox-alpha)
+                    try:
+                        config.set_config_model(event.chat_id, mid)
+                    except Exception as _ce:
+                        log.warning(".ub models set_config_model error: %s", _ce)
+                    await event.edit(f"⏳ ganti model chat ini ke {mname} — restart session...")
+                    try:
+                        await hermes_bridge.restart_chat_session(event.chat_id, model=mid)
+                        await event.edit(f"✅ model chat ini → {mname}")
+                    except Exception as _me:
+                        log.warning(".ub models restart error: %s", _me)
+                        await event.edit(f"✅ model ke-set ({mname}) — session restart gagal ({_me}), pesan berikutnya spawn baru otomatis")
+                else:
+                    await event.edit(f"nomor model gak valid (1-{len(config.MODEL_LIST)})")
+            else:
+                await event.edit("format: `.ub models` (list) atau `.ub models <nomor>`")
+        except Exception as _me:
+            log.warning(".ub models error: %s", _me)
+            await event.edit("⚠️ error pas proses .ub models")
     elif cmd == "reset":
         history.clear()
         killed = await hermes_bridge.reset_sessions()
         await event.edit(f"🧹 Konteks dibersihkan ({killed} sesi di-reset)")
+    elif cmd in ("tools inactive", "tools active"):
+        try:
+            if cmd == "tools inactive":
+                tools_inactive.add(event.chat_id)
+                _save_state(enabled, disabled_users)
+                await event.edit("🔕 bubble progress tool di chat ini dimatiin. cuma reply final yang muncul. (`.ub tools active` buat balikin)")
+            else:
+                tools_inactive.discard(event.chat_id)
+                _save_state(enabled, disabled_users)
+                await event.edit("🔔 bubble progress tool aktif lagi di chat ini.")
+        except Exception as _e:
+            log.warning(".ub tools (self) error: %s", _e)
+    elif cmd in ("help", ""):
+        try:
+            await event.edit(_UB_HELP)
+        except Exception as _e:
+            log.warning(".ub help (self) error: %s", _e)
 
 async def _session_reaper() -> None:
     """Kill session CLI yang idle lama (> SESSION_IDLE_KILL) — free RAM.
@@ -1994,10 +2453,37 @@ async def _session_reaper() -> None:
                 if idle > config.SESSION_IDLE_KILL:
                     await hermes_bridge._run("kill-session", "-t", name)
                     log.info("session %s idle %ds > %d — di-kill (free RAM)", name, idle, config.SESSION_IDLE_KILL)
+                    # ── FIX (21 Agu): prune state.db rolling window abis session
+                    # di-kill — racun task lama gak numpuk & session berikutnya
+                    # spawn fresh dari state.db yang bersih
+                    cid = hermes_bridge._session_to_chat_id(name)
+                    if cid:
+                        try:
+                            await hermes_bridge._prune_state_db(cid)
+                        except Exception as _pe:
+                            log.warning("prune state.db %s gagal: %s", cid, _pe)
             except Exception:
                 continue
     except Exception as e:
         log.warning("session reaper gagal: %s", e)
+
+async def _sweep_pending_dm() -> None:
+    """DM relay timeout: user gak bales dalam 3 menit → auto-skip + notify
+    grup asal (agent lanjut tanpa user itu — user lain gak usah nunggu)."""
+    try:
+        expired = hermes_bridge.sweep_pending_dm()
+        for uid, chat_id in expired:
+            if chat_id < 0:
+                try:
+                    await hermes_bridge.notify_group(
+                        chat_id,
+                        f"[user {uid} gak bales DM dalam 3 menit — request dianggap skip, lanjut tanpa dia]",
+                    )
+                    log.info("DM relay timeout: user=%s chat=%s auto-skip", uid, chat_id)
+                except Exception as _e:
+                    log.warning("notify DM timeout gagal: %s", _e)
+    except Exception as e:
+        log.warning("sweep pending DM gagal: %s", e)
 
 async def _sweep_stale_heartbeats(limit_chats: int = 10, per_chat: int = 25) -> None:
     """Bersihin heartbeat '⏳ Working' yang nyangkut dari run sebelumnya
@@ -2292,6 +2778,18 @@ async def main():
                 await asyncio.sleep(300)
     asyncio.create_task(_reaper_loop())
     log.info("session reaper aktif (idle kill %ds)", config.SESSION_IDLE_KILL)
+
+    # ── DM RELAY SWEEPER: pending DM yang gak dibales 3 menit → auto-skip
+    # (user lain gak usah nunggu lama; grup di-notify biar agent lanjut).
+    async def _dm_sweep_loop():
+        while True:
+            try:
+                await asyncio.sleep(30)  # tiap 30 detik
+                await _sweep_pending_dm()
+            except Exception:
+                await asyncio.sleep(30)
+    asyncio.create_task(_dm_sweep_loop())
+    log.info("DM relay sweeper aktif (timeout 180s)")
 
     await client.run_until_disconnected()
 

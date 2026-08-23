@@ -1,0 +1,4 @@
+{
+  "_doc": "Moderation rules — di-manage oleh agent (hermes) atas instruksi OWNER/ADMIN grup. Format rule: {pattern, action, scope, created_by, created_at, enabled}. pattern = contoh pesan (kata kunci). action = list aksi. scope = chat_id grup. cuma OWNER (1118770958) + admin grup yang boleh bikin/ubah/hapus rule (verify via mod_actions.py is_admin).",
+  "rules": []
+}

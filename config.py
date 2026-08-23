@@ -1,4 +1,5 @@
 import os
+import json
 
 
 def load_dotenv(path=".env"):
@@ -32,9 +33,117 @@ API_KEY = (
     or ""
 )
 MODEL = os.environ.get("UB_MODEL", "deepseek/deepseek-v4-flash-0731")
-MAX_TOKENS = int(os.environ.get("UB_MAX_TOKENS", "800"))
+MAX_TOKENS = int(os.environ.get("UB_MAX_TOKENS", "2000"))
 TEMPERATURE = float(os.environ.get("UB_TEMPERATURE", "0.7"))
 API_TIMEOUT = float(os.environ.get("UB_TIMEOUT", "60"))
+
+# ── FIX (23 Agu): per-chat model override — `.ub models <N>` di chat manapun
+# nyimpen model buat chat_id itu (grup/private) di chat_models.json. Agent
+# hermes di chat itu di-spawn ulang pake UB_MODEL sesuai override.
+CHAT_MODELS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_models.json")
+MODEL_LIST = [
+    ("deepseek-v4-pro", "DeepSeek V4 Pro"),
+    ("deepseek-v4-flash", "DeepSeek V4 Flash"),
+]
+
+def load_chat_models() -> dict:
+    try:
+        with open(CHAT_MODELS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_chat_models(data: dict) -> None:
+    try:
+        with open(CHAT_MODELS_FILE, "w") as f:
+            json.dump(data, f, indent=1)
+    except Exception:
+        pass
+
+def chat_model(chat_id):
+    """Model override utk chat ini; fallback ke MODEL global."""
+    return load_chat_models().get(str(chat_id)) or MODEL
+
+
+def set_config_model(chat_id, model):
+    """Patch `model.default` di config.yaml user/grup chat itu.
+
+    `.ub models` butuh ini — env UB_MODEL doang GAK nge-override config
+    yang set provider/model eksplisit (kasus 5867297862: config default
+    stealth/ox-alpha & deepseek-v4-pro menang atas env).
+    """
+    import re
+    for base in ("/srv/ubox/users", "/srv/ubox/groups"):
+        f = os.path.join(base, str(chat_id), ".hermes", "config.yaml")
+        if not os.path.exists(f):
+            continue
+        try:
+            txt = open(f, encoding="utf-8").read()
+            new, n = re.subn(
+                r"(?m)^(\s*default:\s*)\S+", r"\g<1>" + model, txt, count=1
+            )
+            if n:
+                with open(f, "w", encoding="utf-8") as fh:
+                    fh.write(new)
+                try:
+                    os.chown(f, 1000, 1000)  # ubox
+                    os.chmod(f, 0o644)
+                except Exception:
+                    pass
+                return f
+        except Exception:
+            pass
+    return None
+
+
+def set_config_model_all(model):
+    """Patch `model.default` di SEMUA config user+grup.
+
+    Dipanggil `.ub models all <nomor>` — biar satu perintah nge-ganti
+    model di seluruh fleet, bukan per-chat.
+    """
+    import re
+    patched = []
+    for base in ("/srv/ubox/users", "/srv/ubox/groups"):
+        try:
+            entries = sorted(os.listdir(base))
+        except Exception:
+            continue
+        for e in entries:
+            f = os.path.join(base, e, ".hermes", "config.yaml")
+            if not os.path.exists(f):
+                continue
+            try:
+                txt = open(f, encoding="utf-8").read()
+                new, n = re.subn(
+                    r"(?m)^(\s*default:\s*)\S+", r"\g<1>" + model, txt, count=1
+                )
+                if n:
+                    with open(f, "w", encoding="utf-8") as fh:
+                        fh.write(new)
+                    try:
+                        os.chown(f, 1000, 1000)
+                        os.chmod(f, 0o644)
+                    except Exception:
+                        pass
+                    patched.append(os.path.basename(base) + "/" + e)
+            except Exception:
+                pass
+    return patched
+
+
+def save_chat_models_all(model):
+    """Set override per-chat untuk SEMUA chat ke model yang sama."""
+    ids = set()
+    for base in ("/srv/ubox/users", "/srv/ubox/groups"):
+        try:
+            for e in os.listdir(base):
+                ids.add(e)
+        except Exception:
+            pass
+    data = {i: model for i in ids}
+    save_chat_models(data)
+    return sorted(ids)
 
 # ── Behavior
 UB_MODE = os.environ.get("UB_MODE", "hermes")            # hermes (agent penuh) | llm (raw API)
@@ -44,6 +153,9 @@ HERMES_TOOLSETS = os.environ.get(
     "vision,image_gen,tts,code_execution,kanban,clarify",
 )
 HERMES_TIMEOUT = float(os.environ.get("UB_HERMES_TIMEOUT", "120"))  # detik IDLE (nggak ada aktivitas) sebelum dianggap macet
+# ── FIX (18:00): ANTI-FREEZE — "preparing X…" (model generate argumen tool)
+# gantung > FREEZE_PREP_SEC (stream mati, infinite retry) → AgentError.
+FREEZE_PREP_SEC = float(os.environ.get("UB_FREEZE_PREP_SEC", "180"))
 # HARD TIMEOUT: 0 = NONAKTIF (sama kayak Hermes asli — CLI recovery
 # kontinuasi/fallback/synthesizing JALAN SAMPE KELAR, nggak ada yang nge-cut).
 HERMES_HARD_TIMEOUT = float(os.environ.get("UB_HERMES_HARD_TIMEOUT", "0"))
